@@ -126,8 +126,11 @@ it. ZeroTier encrypts peer-to-peer; do not put this on an untrusted network.
   does not say which, so neither does this.
 - Claude subagent `type` is often blank because the parent records
   `agentType: null` for most spawns. Missing at the source, not dropped here.
-- Codex turn counts are under-reported (only the tail is scanned for
-  `turn_context`).
+- Turn counts are **tail-window** for both harnesses, like token totals. Codex
+  turns count assistant messages (`response_item` / `message` / `role:assistant`),
+  which agrees with its `agent_message` event count. They are *not* counted from
+  `turn_context` — that is written once per session, not once per turn, and
+  counting it reported every Codex session as having taken exactly one turn.
 
 ## Two traps worth knowing if you read transcripts yourself
 

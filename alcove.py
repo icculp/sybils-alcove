@@ -410,15 +410,24 @@ def scan_codex(path: Path) -> dict[str, Any]:
         if not isinstance(payload, dict):
             continue
         if kind == "turn_context":
+            # `turn_context` is written once per SESSION (and again on a model or
+            # effort change) — not once per turn. Counting it as a turn reported
+            # every Codex session and subagent as having taken exactly one.
             model = payload.get("model")
             if payload.get("effort"):
                 effort = str(payload["effort"])
             if is_real_model(model):
-                turns += 1
-                ctx_turns += 1
-                if ts:
+                if ts and not last_ts:
                     last_ts = ts
                 push_model(timeline, str(model), ts)
+        elif (kind == "response_item" and payload.get("type") == "message"
+                and payload.get("role") == "assistant"):
+            # The real per-turn signal, and it agrees with the count of
+            # `event_msg`/`agent_message` events on the same transcript.
+            turns += 1
+            ctx_turns += 1
+            if ts:
+                last_ts = ts
         elif kind == "event_msg" and payload.get("type") == "token_count":
             info = payload.get("info")
             if not isinstance(info, dict):
@@ -519,7 +528,9 @@ def collect_codex() -> list[dict[str, Any]]:
         subs.sort(key=live_first)
         sessions.append({
             "harness": "codex", "session_id": info["session_id"],
-            "label": info["session_id"][:8],
+            # Codex thread ids are time-ordered, so two sessions started in the
+            # same window share an 8-char prefix and read as one duplicated row.
+            "label": info["session_id"][:13],
             "project": Path(info["cwd"]).name if info["cwd"] else "unknown",
             "cwd": info["cwd"], "branch": "", "effort": info["effort"],
             "model": info["model"], "timeline": info["timeline"],
@@ -578,12 +589,18 @@ def running_pids() -> tuple[dict[str, list[int]], str]:
         rows = json.loads(proc.stdout) if proc.stdout.strip() else []
     except ValueError:
         return {}, "unavailable: unparseable output"
-    out: dict[str, list[int]] = {}
+    out: dict[str, dict[str, Any]] = {}
     for row in rows if isinstance(rows, list) else []:
         sid, pid = str(row.get("sessionId") or ""), row.get("pid")
         # The CLI can list an entry whose process is already gone.
-        if sid and isinstance(pid, int) and Path(f"/proc/{pid}").exists():
-            out.setdefault(sid, []).append(pid)
+        if not (sid and isinstance(pid, int) and Path(f"/proc/{pid}").exists()):
+            continue
+        entry = out.setdefault(sid, {"pids": [], "name": "", "kind": ""})
+        entry["pids"].append(pid)
+        # The CLI's own label for the window ("root-4c"), so a row can be matched
+        # to the terminal the operator is actually typing in.
+        entry["name"] = entry["name"] or str(row.get("name") or "")
+        entry["kind"] = entry["kind"] or str(row.get("kind") or "")
     return out, "ok"
 
 
@@ -615,7 +632,10 @@ def collect() -> dict[str, Any]:
     pids, pid_source = running_pids()
     sessions = collect_claude() + collect_codex()
     for session in sessions:
-        session["pids"] = pids.get(session["session_id"], [])
+        proc = pids.get(session["session_id"]) or {}
+        session["pids"] = proc.get("pids") or []
+        session["agent_name"] = proc.get("name") or ""
+        session["kind"] = proc.get("kind") or ""
         session["switches"] = max(0, len(session["timeline"]) - 1)
         # Three distinct facts, never collapsed into one "live" flag:
         #   running  — a process owns this session id right now (authoritative)
@@ -692,6 +712,7 @@ cursor:pointer;user-select:none}
 .st.live{color:var(--live)}.st.warn{color:var(--warn)}
 .st.idle{color:var(--idle)}.st.unk{color:var(--warn)}
 .warnx{color:var(--warn);font-weight:600}
+.nm{color:var(--sub);font-weight:600}
 .sid{color:var(--acc);font-weight:600}
 .hz{font-size:10px;letter-spacing:.5px;border:1px solid var(--line);
 border-radius:3px;padding:0 4px;color:var(--dim);text-transform:uppercase}
@@ -864,6 +885,8 @@ function render(d){
       + '<span class="st '+DOT[s.state]+'">'+s.state
       +   (s.state_inferred&&s.state!=='ended'?'?':'')+'</span>'
       + '<span class="sid">'+esc(s.label)+'</span>'
+      + (s.agent_name?'<span class="nm" title="the CLI\'s name for this window'
+          +(s.kind?' ('+esc(s.kind)+')':'')+'">'+esc(s.agent_name)+'</span>':'')
       + '<span class="model">'+esc(s.model||'unknown')+'</span>'
       + (s.switches?'<span class="pill warn">'+s.switches+' switch'+(s.switches>1?'es':'')+'</span>':'')
       + (s.effort?'<span class="pill">'+esc(s.effort)+'</span>':'')
