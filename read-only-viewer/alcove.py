@@ -1067,7 +1067,7 @@ border-radius:5px;padding:9px;font:inherit;cursor:pointer}
 code{color:#8b949e}</style></head><body>
 <form method="POST" action="/login" autocomplete="off">
 <h1>SYBIL'S ALCOVE</h1>
-<p>Token required. Value is in <code>/etc/alcove/env</code>.</p>
+<p>Token required — the <code>ALCOVE_TOKEN</code> this server was started with.</p>
 <input type="password" name="token" placeholder="ALCOVE_TOKEN" autofocus
   autocomplete="current-password" spellcheck="false">
 <button type="submit">unlock</button>

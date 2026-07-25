@@ -1,2 +1,7 @@
 __pycache__/
 *.pyc
+
+# Holds a live token. Only .env.example belongs in git.
+.env
+*.env
+!.env.example
