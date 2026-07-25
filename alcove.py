@@ -28,10 +28,12 @@ authentication, and this exposes prompts.
 
 from __future__ import annotations
 
+import glob
 import hmac
 import json
 import os
 import secrets
+import shutil
 import subprocess
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -50,6 +52,9 @@ LIVE_WINDOW_S = float(os.environ.get("ALCOVE_LIVE_WINDOW_S", "300"))
 # Transcripts reach 100MB+; only the tail is read, so totals are recent-window.
 TAIL_LINES = int(os.environ.get("ALCOVE_TAIL_LINES", "4000"))
 TAIL_BYTES = int(os.environ.get("ALCOVE_TAIL_BYTES", str(1 << 20)))
+# The `claude` CLI supplies the authoritative session-id -> pid mapping. Set this
+# when it is not on PATH, which is the normal case under systemd.
+CLAUDE_BIN = os.environ.get("ALCOVE_CLAUDE_BIN", "")
 CACHE_TTL_S = 2.0
 
 # Shared secret required when not bound to loopback. Empty + non-local bind is
@@ -530,35 +535,116 @@ def collect_codex() -> list[dict[str, Any]]:
 
 # ------------------------------------------------------------------ live process
 
-def running_pids() -> dict[str, list[int]]:
-    """sessionId -> pids, from the Claude CLI's own process list."""
+def claude_bin() -> str:
+    """Absolute path to the `claude` CLI.
+
+    A bare "claude" resolves fine in a login shell and not at all under systemd,
+    whose PATH has no nvm directory. That failure was swallowed by a bare except
+    for the entire life of the pid column: every session reported no process, so
+    liveness silently degraded to "was this file written recently", which reports
+    a busy session as idle and a dead one as present.
+    """
+    if CLAUDE_BIN:
+        return CLAUDE_BIN
+    found = shutil.which("claude")
+    if found:
+        return found
+    for pattern in ("/root/.nvm/versions/node/*/bin/claude",
+                    "/usr/local/bin/claude", "/usr/bin/claude"):
+        for hit in sorted(glob.glob(pattern), reverse=True):
+            if os.access(hit, os.X_OK):
+                return hit
+    return ""
+
+
+def running_pids() -> tuple[dict[str, list[int]], str]:
+    """(sessionId -> live pids, status).
+
+    Status is reported to the page rather than discarded: "no process" and "I
+    could not ask" must not look the same, or a broken lookup reads as every
+    session having ended.
+    """
+    exe = claude_bin()
+    if not exe:
+        return {}, "unavailable: claude CLI not found"
     try:
-        raw = subprocess.run(
-            ["claude", "agents", "--json", "--all"],
-            capture_output=True, text=True, timeout=20,
-        ).stdout
-        rows = json.loads(raw) if raw.strip() else []
-    except Exception:
-        return {}
+        proc = subprocess.run([exe, "agents", "--json", "--all"],
+                              capture_output=True, text=True, timeout=25)
+    except Exception as err:  # noqa: BLE001 - reported, not swallowed
+        return {}, f"unavailable: {type(err).__name__}"
+    if proc.returncode != 0:
+        return {}, f"unavailable: exit {proc.returncode}"
+    try:
+        rows = json.loads(proc.stdout) if proc.stdout.strip() else []
+    except ValueError:
+        return {}, "unavailable: unparseable output"
     out: dict[str, list[int]] = {}
     for row in rows if isinstance(rows, list) else []:
         sid, pid = str(row.get("sessionId") or ""), row.get("pid")
-        if sid and isinstance(pid, int):
+        # The CLI can list an entry whose process is already gone.
+        if sid and isinstance(pid, int) and Path(f"/proc/{pid}").exists():
             out.setdefault(sid, []).append(pid)
-    return out
+    return out, "ok"
+
+
+def codex_process_count() -> int | None:
+    """How many `codex` processes are running, or None if /proc is unreadable.
+
+    Deliberately a count and not a mapping: Codex puts no thread id in its argv
+    and holds no transcript fd open, so there is no honest way to attribute a
+    process to a session. Counting argv[0] basenames avoids double-counting the
+    `node` wrapper that fronts each one.
+    """
+    try:
+        entries = [p for p in Path("/proc").iterdir() if p.name.isdigit()]
+    except OSError:
+        return None
+    total = 0
+    for entry in entries:
+        try:
+            argv = (entry / "cmdline").read_bytes().split(b"\0")
+        except OSError:
+            continue
+        if argv and argv[0] and os.path.basename(argv[0].decode(
+                "utf-8", errors="replace")) == "codex":
+            total += 1
+    return total
 
 
 def collect() -> dict[str, Any]:
-    pids = running_pids()
+    pids, pid_source = running_pids()
     sessions = collect_claude() + collect_codex()
     for session in sessions:
         session["pids"] = pids.get(session["session_id"], [])
         session["switches"] = max(0, len(session["timeline"]) - 1)
-    sessions.sort(key=live_first)
+        # Three distinct facts, never collapsed into one "live" flag:
+        #   running  — a process owns this session id right now (authoritative)
+        #   writing  — no owning process, but the transcript moved recently
+        #   ended    — neither; the transcript is all that is left
+        #   unknown  — the pid lookup failed, so absence proves nothing
+        if session["pids"]:
+            session["state"] = "running"
+        elif session["harness"] == "claude" and pid_source != "ok":
+            session["state"] = "unknown"
+        elif session["live"]:
+            session["state"] = "writing"
+        else:
+            session["state"] = "ended"
+        # Codex has no per-session pid, so its transcript freshness is the only
+        # signal available — mark it inferred rather than implying certainty.
+        session["state_inferred"] = session["harness"] != "claude"
+    # State outranks file age: a running session whose transcript has been quiet
+    # for a day still belongs above a finished one that wrote a minute ago.
+    rank = {"running": 0, "writing": 1, "unknown": 2, "ended": 3}
+    sessions.sort(key=lambda s: (rank.get(s["state"], 9),
+                                 s["age_s"] if s["age_s"] is not None else 1e18))
     return {
         "generated_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
         "live_window_s": LIVE_WINDOW_S,
         "tail_lines": TAIL_LINES,
+        "pid_source": pid_source,
+        "claude_bin": claude_bin() or None,
+        "codex_processes": codex_process_count(),
         "sessions": sessions,
     }
 
@@ -600,6 +686,12 @@ cursor:pointer;user-select:none}
 .dot{width:8px;height:8px;border-radius:50%;flex:0 0 auto}
 .dot.live{background:var(--live);box-shadow:0 0 6px var(--live)}
 .dot.idle{background:var(--idle)}
+.dot.warn{background:var(--warn)}
+.dot.unk{background:transparent;border:1px solid var(--warn)}
+.st{font-size:10px;text-transform:uppercase;letter-spacing:.5px}
+.st.live{color:var(--live)}.st.warn{color:var(--warn)}
+.st.idle{color:var(--idle)}.st.unk{color:var(--warn)}
+.warnx{color:var(--warn);font-weight:600}
 .sid{color:var(--acc);font-weight:600}
 .hz{font-size:10px;letter-spacing:.5px;border:1px solid var(--line);
 border-radius:3px;padding:0 4px;color:var(--dim);text-transform:uppercase}
@@ -633,7 +725,8 @@ border-radius:4px;padding:3px 9px;cursor:pointer;font:inherit;font-size:12px}
   <span class="muted" id="stat">loading…</span>
   <span class="grow"></span>
   <select id="filter">
-    <option value="live">live only</option>
+    <option value="running">running (has process)</option>
+    <option value="live">running or writing</option>
     <option value="active">active subagents</option>
     <option value="subs">has subagents</option>
     <option value="all" selected>all sessions</option>
@@ -673,6 +766,18 @@ function timelineHTML(t){
   return '<div class="tl">switched: ' + t.map(x =>
     '<span class="sw">'+esc(x.model)+'</span>'+(x.at?' <span class="muted">'+HHMM(x.at)+'</span>':'')
   ).join(' <span class="muted">→</span> ') + '</div>';
+}
+
+// A transcript on disk is not a session. `running` means a live process owns the
+// session id; everything else is weaker evidence and is labelled as such.
+const DOT = {running:'live', writing:'warn', ended:'idle', unknown:'unk'};
+function STATE_WHY(s){
+  if(s.state === 'running') return 'process alive: pid '+s.pids.join(', ');
+  if(s.state === 'unknown') return 'pid lookup failed — absence proves nothing';
+  if(s.state === 'writing') return s.state_inferred
+    ? 'no per-session pid for this harness; transcript written recently'
+    : 'no owning process, but the transcript was written recently';
+  return 'no process and no recent write — transcript only';
 }
 
 // Compaction is the one event that invalidates every token total above it, so
@@ -729,16 +834,21 @@ let last = '';
 function render(d){
   const mode = document.getElementById('filter').value;
   let list = d.sessions;
-  if(mode === 'live') list = list.filter(s => s.live);
+  if(mode === 'running') list = list.filter(s => s.state === 'running');
+  if(mode === 'live') list = list.filter(s => s.live || s.state === 'running');
   if(mode === 'active') list = list.filter(s => s.subagents.some(x => x.live));
   if(mode === 'subs') list = list.filter(s => s.subagents.length);
 
   const liveN = d.sessions.filter(s=>s.live).length;
   const subs = d.sessions.reduce((a,s)=>a+s.subagents.length,0);
   const subsLive = d.sessions.reduce((a,s)=>a+s.subagents.filter(x=>x.live).length,0);
-  document.getElementById('stat').textContent =
-    d.generated_at+' · '+liveN+' live / '+d.sessions.length+' sessions · '
-    +subsLive+' live / '+subs+' subagents';
+  const running = d.sessions.filter(s=>s.state==='running').length;
+  const bad = d.pid_source && d.pid_source !== 'ok';
+  document.getElementById('stat').innerHTML =
+    esc(d.generated_at)+' · <b>'+running+' running</b> / '+liveN+' writing / '
+    +d.sessions.length+' transcripts · '+subsLive+' active / '+subs+' subagents'
+    +(d.codex_processes!=null?' · '+d.codex_processes+' codex proc':'')
+    +(bad?' · <span class="warnx">pid lookup '+esc(d.pid_source)+'</span>':'');
 
   let h = '';
   for(const s of list){
@@ -749,8 +859,10 @@ function render(d){
     const open = collapsed.has(s.session_id) ? '' : ' open';
     h += '<div class="s'+open+'" data-id="'+esc(s.session_id)+'">'
       + '<div class="shead"><span class="caret"></span>'
-      + '<span class="dot '+(s.live?'live':'idle')+'"></span>'
+      + '<span class="dot '+DOT[s.state]+'" title="'+STATE_WHY(s)+'"></span>'
       + '<span class="hz">'+esc(s.harness)+'</span>'
+      + '<span class="st '+DOT[s.state]+'">'+s.state
+      +   (s.state_inferred&&s.state!=='ended'?'?':'')+'</span>'
       + '<span class="sid">'+esc(s.label)+'</span>'
       + '<span class="model">'+esc(s.model||'unknown')+'</span>'
       + (s.switches?'<span class="pill warn">'+s.switches+' switch'+(s.switches>1?'es':'')+'</span>':'')

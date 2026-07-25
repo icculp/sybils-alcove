@@ -23,8 +23,22 @@ nothing surfaces that. Transcripts on disk are the only honest record.
 
 ## What it shows
 
-Per session — harness, live/idle, current model, **model-switch timeline with
+Per session — harness, state, current model, **model-switch timeline with
 timestamps**, reasoning effort, project, branch, token totals, turn count, pid.
+
+**A transcript on disk is not a session.** State is four distinct values, never
+collapsed into one "live" flag:
+
+| state | meaning |
+| --- | --- |
+| `running` | a live process owns this session id — authoritative |
+| `writing` | no owning process found, but the transcript moved recently |
+| `ended` | no process, no recent write; the transcript is all that is left |
+| `unknown` | the pid lookup itself failed, so absence proves nothing |
+
+This matters in both directions. A session in a long tool call writes nothing for
+an hour and looks dead by file age alone, while a finished one-shot run leaves a
+transcript that looks like a session forever. Only the process answers it.
 
 Per subagent — id, role/type, model, running/idle, turns, output/input/cache
 tokens, age, and the task it was given. A session whose subagents run a
@@ -72,6 +86,7 @@ totals in `token_count`.
 | `ALCOVE_TAIL_LINES` | `4000` | Lines read per transcript. |
 | `ALCOVE_CLAUDE_ROOT` | `~/.claude/projects` | |
 | `ALCOVE_CODEX_ROOT` | `~/.codex/sessions` | |
+| `ALCOVE_CLAUDE_BIN` | auto | Path to `claude`. Auto-resolves via PATH, then nvm. |
 | `ALCOVE_TOKEN` | — | Required for any non-loopback bind. |
 
 **On binding:** this page displays task prompts. Default is localhost, which
@@ -91,8 +106,19 @@ it. ZeroTier encrypts peer-to-peer; do not put this on an untrusted network.
 - Reads the **tail** of each transcript (they reach 100MB+), so token totals on
   very long sessions are recent-window, not lifetime. Identity is read from the
   head, so sessions are never missed.
-- **"Live" means the transcript was written recently.** An agent in a long tool
-  call writes nothing and reads idle. Tune `ALCOVE_LIVE_WINDOW_S`.
+- **Codex state is inferred, and says so** (shown as `writing?`). Codex puts no
+  thread id in its argv and holds no transcript fd open, so there is no honest
+  way to attribute a process to a session — only a total count of `codex`
+  processes. Claude state is authoritative because `claude agents --json --all`
+  maps session id to pid.
+- **`writing` still leans on file age** for the no-pid case, so
+  `ALCOVE_LIVE_WINDOW_S` tunes that fallback. `running` does not depend on it.
+- **The pid lookup is a subprocess and can fail.** When it does, the header says
+  so and every Claude session reads `unknown` rather than `ended` — a broken
+  lookup must not render as "everything stopped". This was a real bug: under
+  systemd, PATH has no nvm directory, `claude` did not resolve, and the failure
+  was swallowed, so every session showed no pid and liveness silently degraded
+  to file age.
 - **`idle` is not the same as `done`.** The parent's launch record says
   `async_launched` for every backgrounded subagent and never flips to
   `completed`, so only the 12% that report `completed` can be called finished.
