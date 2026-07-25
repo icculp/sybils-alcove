@@ -41,8 +41,10 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
 
-CLAUDE_ROOT = Path(os.environ.get("ALCOVE_CLAUDE_ROOT", Path.home() / ".claude" / "projects"))
-CODEX_ROOT = Path(os.environ.get("ALCOVE_CODEX_ROOT", Path.home() / ".codex" / "sessions"))
+# expanduser(): these are routinely set from an env file as "~/.claude/…", and
+# a literal "~" path fails is_dir() — the server would exit "no transcripts".
+CLAUDE_ROOT = Path(os.environ.get("ALCOVE_CLAUDE_ROOT", Path.home() / ".claude" / "projects")).expanduser()
+CODEX_ROOT = Path(os.environ.get("ALCOVE_CODEX_ROOT", Path.home() / ".codex" / "sessions")).expanduser()
 PORT = int(os.environ.get("ALCOVE_PORT", "8899"))
 # Localhost by default. Set ALCOVE_BIND=0.0.0.0 deliberately, knowing this page
 # shows task prompts and there is no auth in front of it.
@@ -247,6 +249,7 @@ def scan_claude(path: Path, *, main_thread_only: bool) -> dict[str, Any]:
     pending_args = ""
     usage = new_usage()
     ctx_usage = new_usage()
+    seen_msgs: set[str] = set()
     turns = ctx_turns = 0
     compactions: list[dict[str, Any]] = []
     last_ts = cwd = branch = effort = ""
@@ -298,13 +301,24 @@ def scan_claude(path: Path, *, main_thread_only: bool) -> dict[str, Any]:
         level = event.get("effort")
         if isinstance(level, dict) and level.get("level"):
             effort = str(level["level"])
-        add_anthropic_usage(usage, message.get("usage"))
-        add_anthropic_usage(ctx_usage, message.get("usage"))
+        # One logical turn writes SEVERAL assistant events (one per content
+        # block), each repeating the same message.id AND the same usage dict.
+        # Counting per event overstated one real session's turns 1757 vs 761
+        # and its output tokens 2.18M vs 0.82M — dedupe by message.id. An event
+        # without an id (rare) still counts once on its own.
+        msg_id = str(message.get("id") or "")
+        first = msg_id not in seen_msgs
+        if msg_id:
+            seen_msgs.add(msg_id)
+        if first:
+            add_anthropic_usage(usage, message.get("usage"))
+            add_anthropic_usage(ctx_usage, message.get("usage"))
         model = message.get("model")
         if not is_real_model(model):
             continue
-        turns += 1
-        ctx_turns += 1
+        if first:
+            turns += 1
+            ctx_turns += 1
         push_model(timeline, str(model), ts)
     return {
         "timeline": timeline, "model": timeline[-1]["model"] if timeline else "",
@@ -608,6 +622,23 @@ def collect_codex() -> list[dict[str, Any]]:
 
 # ------------------------------------------------------------------ live process
 
+def pid_alive(pid: int) -> bool:
+    """Portable liveness probe. /proc exists only on Linux — checking it on
+    macOS silently drops every pid and `running` never appears, with the lookup
+    still reporting ok. Signal 0 works everywhere; EPERM means the process
+    exists but belongs to someone else, which is still alive.
+    """
+    try:
+        os.kill(pid, 0)
+        return True
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    except OSError:
+        return False
+
+
 def claude_bin() -> str:
     """Absolute path to the `claude` CLI.
 
@@ -622,7 +653,8 @@ def claude_bin() -> str:
     found = shutil.which("claude")
     if found:
         return found
-    for pattern in ("/root/.nvm/versions/node/*/bin/claude",
+    for pattern in (str(Path.home() / ".nvm/versions/node/*/bin/claude"),
+                    str(Path.home() / ".local/bin/claude"),
                     "/usr/local/bin/claude", "/usr/bin/claude"):
         for hit in sorted(glob.glob(pattern), reverse=True):
             if os.access(hit, os.X_OK):
@@ -655,7 +687,7 @@ def running_pids() -> tuple[dict[str, list[int]], str]:
     for row in rows if isinstance(rows, list) else []:
         sid, pid = str(row.get("sessionId") or ""), row.get("pid")
         # The CLI can list an entry whose process is already gone.
-        if not (sid and isinstance(pid, int) and Path(f"/proc/{pid}").exists()):
+        if not (sid and isinstance(pid, int) and pid_alive(pid)):
             continue
         entry = out.setdefault(sid, {"pids": [], "name": "", "kind": ""})
         entry["pids"].append(pid)
