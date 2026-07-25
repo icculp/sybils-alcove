@@ -32,6 +32,7 @@ import glob
 import hmac
 import json
 import os
+import re
 import secrets
 import shutil
 import subprocess
@@ -190,6 +191,40 @@ def is_real_model(value: Any) -> bool:
     return bool(value) and not str(value).startswith("<")
 
 
+# A `/model` switch is recorded as a user event carrying the slash command and
+# its resolved result. This is the ONLY on-disk record of a switch that never
+# served a turn — `message.model` cannot show one, because no assistant event
+# exists to carry it. The harness does emit a "model has been changed" reminder,
+# but reminders are injected per request and never written to the transcript.
+MODEL_SET_RE = re.compile(r"Set model to ([^<\n]+)")
+MODEL_ARGS_RE = re.compile(r"<command-args>([^<]*)</command-args>")
+# Two stdout shapes exist: the model id ("claude-opus-5[1m]") and a bolded
+# display name with a trailing clause ("<ansi>Opus 4.8 (1M context)<ansi> and
+# saved as your default for new sessions"). Strip the terminal styling and the
+# clause, or the model name comes out as a sentence.
+ANSI_RE = re.compile(r"\x1b\[[0-9;]*m")
+MODEL_TAIL_RE = re.compile(r"\s+and saved as .*$")
+
+
+def clean_model_name(raw: str) -> str:
+    return MODEL_TAIL_RE.sub("", ANSI_RE.sub("", raw)).strip()
+
+
+def event_text(event: dict[str, Any]) -> str:
+    """Flatten an event's content to text; blocks may be a string or a list."""
+    content = (event.get("message") or {}).get("content")
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        return " ".join(b.get("text", "") for b in content if isinstance(b, dict))
+    return ""
+
+
+def push_selection(out: list[dict[str, str]], model: str, at: str, asked: str) -> None:
+    if not out or out[-1]["model"] != model:
+        out.append({"model": model, "at": at, "requested": asked})
+
+
 def live_first(item: dict[str, Any]) -> tuple[bool, float]:
     """Running first, then freshest. Used for the session list AND the subagent
     drilldown so the eye moves the same way at both levels; a subagent with no
@@ -208,6 +243,8 @@ def push_model(timeline: list[dict[str, str]], model: str, at: str) -> None:
 
 def scan_claude(path: Path, *, main_thread_only: bool) -> dict[str, Any]:
     timeline: list[dict[str, str]] = []
+    selections: list[dict[str, str]] = []
+    pending_args = ""
     usage = new_usage()
     ctx_usage = new_usage()
     turns = ctx_turns = 0
@@ -232,6 +269,22 @@ def scan_claude(path: Path, *, main_thread_only: bool) -> dict[str, Any]:
             ctx_usage = new_usage()
             ctx_turns = 0
             continue
+        if event.get("type") == "user":
+            # The command and its resolved output are two events sharing a
+            # timestamp, so remember the requested alias ("opus[1m]") until the
+            # resolved name ("claude-opus-5[1m]") arrives on the next one.
+            text = event_text(event)
+            if "/model" in text:
+                asked = MODEL_ARGS_RE.search(text)
+                if asked:
+                    pending_args = asked.group(1).strip()
+            resolved = MODEL_SET_RE.search(text)
+            if resolved:
+                name = clean_model_name(resolved.group(1))
+                if name:
+                    push_selection(selections, name, ts, pending_args)
+                pending_args = ""
+            continue
         if event.get("type") != "assistant":
             continue
         # A parent's own totals must not absorb its subagents' turns.
@@ -255,6 +308,10 @@ def scan_claude(path: Path, *, main_thread_only: bool) -> dict[str, Any]:
         push_model(timeline, str(model), ts)
     return {
         "timeline": timeline, "model": timeline[-1]["model"] if timeline else "",
+        # What the operator chose, vs what actually served a turn. These are
+        # different facts and a mismatch is meaningful, so keep both.
+        "selections": selections,
+        "selected_model": selections[-1]["model"] if selections else "",
         "usage": usage, "turns": turns, "last_ts": last_ts,
         "cwd": cwd, "branch": branch, "effort": effort,
         "compactions": compactions,
@@ -340,6 +397,8 @@ def collect_claude() -> list[dict[str, Any]]:
                 "harness": "claude", "session_id": sid, "label": sid[:8],
                 "project": project.name, "cwd": info["cwd"], "branch": info["branch"],
                 "effort": info["effort"], "model": info["model"],
+                "selections": info["selections"],
+                "selected_model": info["selected_model"],
                 "timeline": info["timeline"], "usage": info["usage"],
                 "turns": info["turns"], "last_ts": info["last_ts"], "age_s": age,
                 "live": age is not None and age < LIVE_WINDOW_S,
@@ -534,6 +593,9 @@ def collect_codex() -> list[dict[str, Any]]:
             "project": Path(info["cwd"]).name if info["cwd"] else "unknown",
             "cwd": info["cwd"], "branch": "", "effort": info["effort"],
             "model": info["model"], "timeline": info["timeline"],
+            # Codex has no slash-command record; a model change emits its own
+            # `turn_context`, so its served timeline already captures switches.
+            "selections": [], "selected_model": "",
             "usage": info["usage"], "turns": info["turns"],
             "last_ts": info["last_ts"], "age_s": info["age_s"], "live": info["live"],
             "compactions": info["compactions"],
@@ -713,6 +775,7 @@ cursor:pointer;user-select:none}
 .st.idle{color:var(--idle)}.st.unk{color:var(--warn)}
 .warnx{color:var(--warn);font-weight:600}
 .nm{color:var(--sub);font-weight:600}
+.nosrv{color:var(--dim);text-decoration:line-through}
 .sid{color:var(--acc);font-weight:600}
 .hz{font-size:10px;letter-spacing:.5px;border:1px solid var(--line);
 border-radius:3px;padding:0 4px;color:var(--dim);text-transform:uppercase}
@@ -782,11 +845,45 @@ function toggle(id, el){
   saveCollapsed();
 }
 
+// Prefer the operator's own switch count; fall back to changes in served model.
+const SW = s => (s.selections && s.selections.length > 1)
+  ? s.selections.length - 1 : s.switches;
+// Selected one model, but a turn served AFTER that selection used another. The
+// ordering check matters: a selection older than the last served turn is just
+// chronology, not a discrepancy, and flagging it produces false alarms on any
+// session whose tail window predates the switch. `[1m]` is a context variant of
+// the same model, not a different one, so strip it before comparing.
+const bare = m => (m||'').replace(/\[1m\]$/,'');
+function MISMATCH(s){
+  const sel = s.selections || [], tl = s.timeline || [];
+  if(!sel.length || !tl.length || !s.selected_model || !s.model) return false;
+  if(tl[tl.length-1].at < sel[sel.length-1].at) return false;
+  return bare(s.selected_model) !== bare(s.model);
+}
+
 function timelineHTML(t){
   if(!t || t.length < 2) return '';
-  return '<div class="tl">switched: ' + t.map(x =>
+  return '<div class="tl">served: ' + t.map(x =>
     '<span class="sw">'+esc(x.model)+'</span>'+(x.at?' <span class="muted">'+HHMM(x.at)+'</span>':'')
   ).join(' <span class="muted">→</span> ') + '</div>';
+}
+
+// Operator selections, from the `/model` command record. Shown separately from
+// the served timeline because a model can be selected and never serve a turn —
+// which is invisible in `message.model` and was why switches looked unlogged.
+function selectionHTML(s){
+  const sel = s.selections;
+  if(!sel || !sel.length) return '';
+  const served = new Set((s.timeline||[]).map(x => x.model));
+  return '<div class="tl">selected: ' + sel.map(x => {
+    const never = !served.has(x.model) && !served.has(bare(x.model));
+    return '<span class="'+(never?'nosrv':'sw')+'" title="'
+      + (x.requested?'asked for '+esc(x.requested)+'; ':'')
+      + (never?'never served a turn':'served')+'">'+esc(x.model)+'</span>'
+      + (x.at?' <span class="muted">'+HHMM(x.at)+'</span>':'');
+  }).join(' <span class="muted">→</span> ')
+  + (sel.length>1?' <span class="muted">· '+(sel.length-1)+' switch'
+      +(sel.length>2?'es':'')+'</span>':'') + '</div>';
 }
 
 // A transcript on disk is not a session. `running` means a live process owns the
@@ -888,7 +985,11 @@ function render(d){
       + (s.agent_name?'<span class="nm" title="the CLI\'s name for this window'
           +(s.kind?' ('+esc(s.kind)+')':'')+'">'+esc(s.agent_name)+'</span>':'')
       + '<span class="model">'+esc(s.model||'unknown')+'</span>'
-      + (s.switches?'<span class="pill warn">'+s.switches+' switch'+(s.switches>1?'es':'')+'</span>':'')
+      + (SW(s)?'<span class="pill warn" title="'+(s.selections&&s.selections.length
+          ?'operator /model switches':'changes in the serving model')+'">'
+          +SW(s)+' switch'+(SW(s)>1?'es':'')+'</span>':'')
+      + (MISMATCH(s)?'<span class="pill warn" title="selected but the last turn '
+          +'was served by a different model">sel '+esc(s.selected_model)+'</span>':'')
       + (s.effort?'<span class="pill">'+esc(s.effort)+'</span>':'')
       + '<span class="pill">'+esc(s.project)+'</span>'
       + (s.branch?'<span class="pill">'+esc(s.branch)+'</span>':'')
@@ -908,8 +1009,8 @@ function render(d){
           +s.turns+' turns</span>'
       + (s.pids.length?'<span class="pill">pid '+s.pids.join(',')+'</span>':'')
       + '<span class="muted">'+AGE(s.age_s)+'</span>'
-      + '</div><div class="body">'+timelineHTML(s.timeline)+compactHTML(s)
-      + subTable(s.subagents)+'</div></div>';
+      + '</div><div class="body">'+selectionHTML(s)+timelineHTML(s.timeline)
+      + compactHTML(s)+subTable(s.subagents)+'</div></div>';
   }
   h = h || '<p class="muted">no sessions match this filter</p>';
   // Only touch the DOM when something actually changed, so a refresh mid-scroll

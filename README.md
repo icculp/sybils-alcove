@@ -21,6 +21,28 @@ the switch appearing in the conversation.** If you dispatch a fan-out, the
 subagents may run on a different model than the thread that spawned them, and
 nothing surfaces that. Transcripts on disk are the only honest record.
 
+### Selected vs served — two different facts
+
+- **selected** — what you chose, parsed from the `/model` command record
+- **served** — what actually ran a turn, from `message.model` on assistant events
+
+They are tracked separately because they disagree in a way that matters: a model
+selected and then switched away from **before it ever ran a turn** leaves no
+assistant event at all, so it is invisible in served history. Selecting `fable`
+and returning to `opus` 30 seconds later produces zero served-model changes and
+looks exactly like no switch ever happened. Selections carry exact timestamps; a
+selection that never served is struck through.
+
+A `sel …` flag appears only when a turn served **after** a selection used a
+different model. The ordering check is deliberate — a selection older than the
+last served turn is chronology, not a discrepancy, and flagging it would false-
+alarm on every session whose tail window predates the switch. `[1m]` is a context
+variant of the same model and is not treated as a different one.
+
+Claude Code does emit a mid-session "model has been changed" system reminder, but
+reminders are injected per request and **never written to the transcript**, so
+they cannot be a source here. The slash-command record is the only durable one.
+
 ## What it shows
 
 Per session — harness, state, current model, **model-switch timeline with
