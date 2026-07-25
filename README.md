@@ -43,6 +43,14 @@ Claude Code does emit a mid-session "model has been changed" system reminder, bu
 reminders are injected per request and **never written to the transcript**, so
 they cannot be a source here. The slash-command record is the only durable one.
 
+**Selections appear one message late.** `/model` is a local command, and Claude
+Code buffers local-command events into the transcript at the *next user message*.
+Switch four times without sending anything and the page shows none of them; send
+one message and all four appear at once, with their original timestamps intact —
+nothing is lost, it arrives late. This is a floor for any disk-based reader: until
+that flush the selection exists only in the CLI process's memory, and
+`claude agents --json` reports pid, cwd, and session id but not the model.
+
 ## What it shows
 
 Per session — harness, state, current model, **model-switch timeline with
