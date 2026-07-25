@@ -28,13 +28,15 @@ authentication, and this exposes prompts.
 
 from __future__ import annotations
 
+import hmac
 import json
 import os
+import secrets
 import subprocess
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from typing import Any, Iterator
+from typing import Any
 
 CLAUDE_ROOT = Path(os.environ.get("ALCOVE_CLAUDE_ROOT", Path.home() / ".claude" / "projects"))
 CODEX_ROOT = Path(os.environ.get("ALCOVE_CODEX_ROOT", Path.home() / ".codex" / "sessions"))
@@ -49,6 +51,21 @@ LIVE_WINDOW_S = float(os.environ.get("ALCOVE_LIVE_WINDOW_S", "300"))
 TAIL_LINES = int(os.environ.get("ALCOVE_TAIL_LINES", "4000"))
 TAIL_BYTES = int(os.environ.get("ALCOVE_TAIL_BYTES", str(1 << 20)))
 CACHE_TTL_S = 2.0
+
+# Shared secret required when not bound to loopback. Empty + non-local bind is
+# refused at startup rather than served open (see main()).
+TOKEN = os.environ.get("ALCOVE_TOKEN", "")
+COOKIE = "alcove_token"
+LOCAL_BINDS = {"127.0.0.1", "localhost", "::1"}
+
+
+def is_local_bind() -> bool:
+    return BIND in LOCAL_BINDS
+
+
+def token_ok(supplied: str) -> bool:
+    """Constant-time compare so a wrong guess leaks no timing signal."""
+    return bool(TOKEN) and hmac.compare_digest(supplied, TOKEN)
 
 _cache: dict[str, Any] = {"at": 0.0, "data": None}
 
@@ -693,21 +710,103 @@ load(); arm();
 """
 
 
+LOGIN = """<!doctype html><html><head><meta charset="utf-8"><title>alcove</title>
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<style>body{background:#0d1117;color:#e6edf3;font:14px/1.6 ui-monospace,
+SFMono-Regular,Menlo,monospace;display:grid;place-items:center;height:100vh;margin:0}
+form{background:#161b22;border:1px solid #30363d;border-radius:8px;padding:24px;
+min-width:min(380px,90vw)}
+h1{font-size:14px;letter-spacing:1px;margin:0 0 4px}
+p{color:#8b949e;font-size:12px;margin:0 0 16px}
+input{width:100%;background:#0d1117;border:1px solid #30363d;border-radius:5px;
+color:#e6edf3;padding:9px;font:inherit;margin-bottom:12px}
+input:focus{outline:none;border-color:#58a6ff}
+button{width:100%;background:#238636;border:1px solid #2ea043;color:#fff;
+border-radius:5px;padding:9px;font:inherit;cursor:pointer}
+.err{color:#f85149;font-size:12px;margin:12px 0 0}
+code{color:#8b949e}</style></head><body>
+<form method="POST" action="/login" autocomplete="off">
+<h1>SYBIL'S ALCOVE</h1>
+<p>Token required. Value is in <code>/etc/alcove/env</code>.</p>
+<input type="password" name="token" placeholder="ALCOVE_TOKEN" autofocus
+  autocomplete="current-password" spellcheck="false">
+<button type="submit">unlock</button>
+__ERR__
+</form></body></html>"""
+
+
 class Handler(BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
     server_version = "alcove"
 
-    def _send(self, body: bytes, ctype: str) -> None:
-        self.send_response(200)
+    def _send(self, body: bytes, ctype: str, status: int = 200,
+              cookie: str | None = None) -> None:
+        self.send_response(status)
         self.send_header("Content-Type", ctype)
         self.send_header("Content-Length", str(len(body)))
         self.send_header("Cache-Control", "no-store")
+        if cookie:
+            # HttpOnly so page scripts cannot read it back out; SameSite=Strict
+            # so another origin cannot ride the cookie. No Secure flag: the
+            # overlay is plain HTTP.
+            self.send_header(
+                "Set-Cookie",
+                f"{COOKIE}={cookie}; Path=/; HttpOnly; SameSite=Strict; Max-Age=604800")
         self.end_headers()
         self.wfile.write(body)
 
+    def _supplied_token(self) -> str:
+        """Bearer header for scripts, cookie for browsers.
+
+        Deliberately no `?token=` support: a secret in a URL lands in browser
+        history, screenshots, referers, and shell history.
+        """
+        auth = self.headers.get("Authorization", "")
+        if auth.startswith("Bearer "):
+            return auth[len("Bearer "):].strip()
+        for part in self.headers.get("Cookie", "").split(";"):
+            name, _, value = part.strip().partition("=")
+            if name == COOKIE:
+                return value
+        return ""
+
+    def _login_page(self, error: str = "", status: int = 200) -> None:
+        body = LOGIN.replace(
+            "__ERR__", f'<p class="err">{error}</p>' if error else "")
+        self._send(body.encode(), "text/html; charset=utf-8", status=status)
+
+    def do_POST(self) -> None:  # noqa: N802
+        if self.path.split("?", 1)[0] != "/login":
+            self.send_error(404)
+            return
+        length = min(int(self.headers.get("Content-Length") or 0), 4096)
+        raw = self.rfile.read(length).decode("utf-8", errors="replace") if length else ""
+        from urllib.parse import parse_qs
+        supplied = (parse_qs(raw).get("token") or [""])[0]
+        if not token_ok(supplied):
+            self._login_page("rejected", status=401)
+            return
+        # 303 so the browser re-requests with GET and the POST body is not
+        # replayed on refresh.
+        self.send_response(303)
+        self.send_header("Location", "/")
+        self.send_header(
+            "Set-Cookie",
+            f"{COOKIE}={supplied}; Path=/; HttpOnly; SameSite=Strict; Max-Age=604800")
+        self.send_header("Content-Length", "0")
+        self.end_headers()
+
     def do_GET(self) -> None:  # noqa: N802
         route = self.path.split("?", 1)[0]
-        if route in ("/", "/index.html"):
+        # Loopback is trusted; anything wider requires the shared secret.
+        if not is_local_bind() and not token_ok(self._supplied_token()):
+            if route == "/api/sessions":
+                self._send(b'{"error":"unauthorized"}', "application/json", status=401)
+            else:
+                self._login_page(status=401)
+            return
+
+        if route in ("/", "/index.html", "/login"):
             self._send(PAGE.encode(), "text/html; charset=utf-8")
         elif route == "/api/sessions":
             self._send(json.dumps(cached()).encode(), "application/json")
@@ -722,11 +821,18 @@ def main() -> int:
     if not CLAUDE_ROOT.is_dir() and not CODEX_ROOT.is_dir():
         print(f"no transcripts found under {CLAUDE_ROOT} or {CODEX_ROOT}")
         return 1
+    # Fail closed: this page shows task prompts, so a non-loopback bind without
+    # a token is a mistake, not a default worth honouring.
+    if not is_local_bind() and not TOKEN:
+        print(f"refusing to serve {BIND}:{PORT} without ALCOVE_TOKEN.\n"
+              f"  generate one:  python3 -c 'import secrets;print(secrets.token_urlsafe(32))'\n"
+              f"  then:          ALCOVE_TOKEN=<token> ALCOVE_BIND={BIND} python3 alcove.py\n"
+              f"  or bind loopback: ALCOVE_BIND=127.0.0.1 python3 alcove.py")
+        return 2
     print(f"alcove: http://{BIND}:{PORT}")
     print(f"  claude: {CLAUDE_ROOT if CLAUDE_ROOT.is_dir() else '(absent)'}")
     print(f"  codex:  {CODEX_ROOT if CODEX_ROOT.is_dir() else '(absent)'}")
-    if BIND not in ("127.0.0.1", "localhost", "::1"):
-        print(f"  NOTE: bound {BIND} — this page shows task prompts and has no auth.")
+    print(f"  auth:   {'token required' if not is_local_bind() else 'loopback (none)'}")
     ThreadingHTTPServer((BIND, PORT), Handler).serve_forever()
     return 0
 

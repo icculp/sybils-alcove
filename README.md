@@ -61,9 +61,19 @@ totals in `token_count`.
 | `ALCOVE_CLAUDE_ROOT` | `~/.claude/projects` | |
 | `ALCOVE_CODEX_ROOT` | `~/.codex/sessions` | |
 
-**On binding:** this page displays task prompts and has no authentication.
-Default is localhost. Widening it puts your prompts on the network — a private
-overlay is not authentication.
+| `ALCOVE_TOKEN` | — | Required for any non-loopback bind. |
+
+**On binding:** this page displays task prompts. Default is localhost, which
+needs no token. Any wider bind **requires `ALCOVE_TOKEN` and refuses to start
+without one** — a private overlay is not authentication.
+
+Browsers get a login form that POSTs the token and stores an HttpOnly,
+SameSite=Strict cookie. There is deliberately no `?token=` URL parameter: a
+secret in a URL leaks into browser history, screenshots, referers, and shell
+history. Scripts use `Authorization: Bearer <token>`.
+
+The wire is plain HTTP, so the token is only as private as the network carrying
+it. ZeroTier encrypts peer-to-peer; do not put this on an untrusted network.
 
 ## Known limits
 
