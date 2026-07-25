@@ -26,12 +26,24 @@ nothing surfaces that. Transcripts on disk are the only honest record.
 Per session — harness, live/idle, current model, **model-switch timeline with
 timestamps**, reasoning effort, project, branch, token totals, turn count, pid.
 
-Per subagent — id, role/type, model, running/done, turns, output/input/cache
-tokens, age, and the task it was given. Sorted live-first. A session whose
-subagents run a different model than the parent is flagged.
+Per subagent — id, role/type, model, running/idle, turns, output/input/cache
+tokens, age, and the task it was given. A session whose subagents run a
+different model than the parent is flagged.
+
+Counts are **active / total**, not lifetime only: a session with 2 running out
+of 28 spawned reads `2 active / 28 sub`, and the `active subagents` filter shows
+only sessions doing work right now. Sessions and the subagent drilldown use the
+same ordering — running first, then freshest.
 
 Subagents appear **as soon as they write their first event**, not when they
 finish.
+
+**Compaction is shown**, because it is the one event that invalidates every
+token total above it. A compacted session gets a `compacted HH:MM:SS` pill, the
+pre-compaction context size where the harness records it, and token/turn figures
+as `since last compaction / tail total`. Without this, compacting a session
+changes nothing on screen and the totals silently describe a context that no
+longer exists.
 
 ## Where the data comes from
 
@@ -60,7 +72,6 @@ totals in `token_count`.
 | `ALCOVE_TAIL_LINES` | `4000` | Lines read per transcript. |
 | `ALCOVE_CLAUDE_ROOT` | `~/.claude/projects` | |
 | `ALCOVE_CODEX_ROOT` | `~/.codex/sessions` | |
-
 | `ALCOVE_TOKEN` | — | Required for any non-loopback bind. |
 
 **On binding:** this page displays task prompts. Default is localhost, which
@@ -82,6 +93,11 @@ it. ZeroTier encrypts peer-to-peer; do not put this on an untrusted network.
   head, so sessions are never missed.
 - **"Live" means the transcript was written recently.** An agent in a long tool
   call writes nothing and reads idle. Tune `ALCOVE_LIVE_WINDOW_S`.
+- **`idle` is not the same as `done`.** The parent's launch record says
+  `async_launched` for every backgrounded subagent and never flips to
+  `completed`, so only the 12% that report `completed` can be called finished.
+  For the rest, an idle transcript may mean finished or abandoned — the harness
+  does not say which, so neither does this.
 - Claude subagent `type` is often blank because the parent records
   `agentType: null` for most spawns. Missing at the source, not dropped here.
 - Codex turn counts are under-reported (only the tail is scanned for

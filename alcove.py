@@ -185,6 +185,15 @@ def is_real_model(value: Any) -> bool:
     return bool(value) and not str(value).startswith("<")
 
 
+def live_first(item: dict[str, Any]) -> tuple[bool, float]:
+    """Running first, then freshest. Used for the session list AND the subagent
+    drilldown so the eye moves the same way at both levels; a subagent with no
+    transcript has no age and sorts last.
+    """
+    age = item.get("age_s")
+    return (not item.get("live"), age if age is not None else 1e18)
+
+
 def push_model(timeline: list[dict[str, str]], model: str, at: str) -> None:
     if not timeline or timeline[-1]["model"] != model:
         timeline.append({"model": model, "at": at})
@@ -195,13 +204,29 @@ def push_model(timeline: list[dict[str, str]], model: str, at: str) -> None:
 def scan_claude(path: Path, *, main_thread_only: bool) -> dict[str, Any]:
     timeline: list[dict[str, str]] = []
     usage = new_usage()
-    turns = 0
+    ctx_usage = new_usage()
+    turns = ctx_turns = 0
+    compactions: list[dict[str, Any]] = []
     last_ts = cwd = branch = effort = ""
     for event in chronological(tail_events(path)):
         if event.get("cwd") and not cwd:
             cwd = str(event["cwd"])
         if event.get("gitBranch") and not branch:
             branch = str(event["gitBranch"])
+        ts = str(event.get("timestamp") or "")
+        # A compact boundary means everything before it has left the context
+        # window. A total that spans the boundary describes a context that no
+        # longer exists, so keep a second set of counters that resets here.
+        if event.get("subtype") == "compact_boundary":
+            meta = event.get("compactMetadata")
+            meta = meta if isinstance(meta, dict) else {}
+            compactions.append({
+                "at": ts, "trigger": str(meta.get("trigger") or ""),
+                "pre_tokens": meta.get("preTokens"),
+            })
+            ctx_usage = new_usage()
+            ctx_turns = 0
+            continue
         if event.get("type") != "assistant":
             continue
         # A parent's own totals must not absorb its subagents' turns.
@@ -210,22 +235,26 @@ def scan_claude(path: Path, *, main_thread_only: bool) -> dict[str, Any]:
         message = event.get("message")
         if not isinstance(message, dict):
             continue
-        ts = str(event.get("timestamp") or "")
         if ts:
             last_ts = ts
         level = event.get("effort")
         if isinstance(level, dict) and level.get("level"):
             effort = str(level["level"])
         add_anthropic_usage(usage, message.get("usage"))
+        add_anthropic_usage(ctx_usage, message.get("usage"))
         model = message.get("model")
         if not is_real_model(model):
             continue
         turns += 1
+        ctx_turns += 1
         push_model(timeline, str(model), ts)
     return {
         "timeline": timeline, "model": timeline[-1]["model"] if timeline else "",
         "usage": usage, "turns": turns, "last_ts": last_ts,
         "cwd": cwd, "branch": branch, "effort": effort,
+        "compactions": compactions,
+        "usage_since_compact": ctx_usage if compactions else None,
+        "turns_since_compact": ctx_turns if compactions else None,
     }
 
 
@@ -298,6 +327,9 @@ def collect_claude() -> list[dict[str, Any]]:
                     "tool_uses": record.get("tool_uses"), "task": record.get("task", ""),
                     "age_s": None, "live": False, "size": 0, "no_transcript": True,
                 })
+            # Running subagents first: a busy session has dozens of finished ones
+            # and glob order (agent id) would bury the two you care about.
+            subs.sort(key=live_first)
             age = mtime_age(transcript)
             sessions.append({
                 "harness": "claude", "session_id": sid, "label": sid[:8],
@@ -306,6 +338,9 @@ def collect_claude() -> list[dict[str, Any]]:
                 "timeline": info["timeline"], "usage": info["usage"],
                 "turns": info["turns"], "last_ts": info["last_ts"], "age_s": age,
                 "live": age is not None and age < LIVE_WINDOW_S,
+                "compactions": info["compactions"],
+                "usage_since_compact": info["usage_since_compact"],
+                "turns_since_compact": info["turns_since_compact"],
                 "subagents": subs, "path": str(transcript),
             })
     return sessions
@@ -322,7 +357,9 @@ def scan_codex(path: Path) -> dict[str, Any]:
     """
     timeline: list[dict[str, str]] = []
     usage = new_usage()
-    turns = 0
+    turns = ctx_turns = 0
+    compactions: list[dict[str, Any]] = []
+    usage_at_compact: dict[str, int] | None = None
     last_ts = cwd = effort = role = nickname = ""
     sid = parent = ""
     context_window = None
@@ -350,15 +387,30 @@ def scan_codex(path: Path) -> dict[str, Any]:
     for event in chronological(tail_events(path)):
         kind = event.get("type")
         payload = event.get("payload")
+        ts = str(event.get("timestamp") or "")
+        # Codex marks one compaction twice — a `compacted` record and an
+        # `event_msg`/`context_compacted` — so dedupe by timestamp. Its token
+        # totals are cumulative snapshots, so the post-boundary figure is a
+        # subtraction, not a reset. No pre-context size is recorded, unlike
+        # Claude's `preTokens`, so don't invent one.
+        if kind == "compacted" or (isinstance(payload, dict)
+                                   and payload.get("type") == "context_compacted"):
+            # The paired markers land milliseconds apart, so compare at second
+            # granularity — two real compactions in one second is not a thing.
+            if not compactions or compactions[-1]["at"][:19] != ts[:19]:
+                compactions.append({"at": ts, "trigger": "", "pre_tokens": None})
+            usage_at_compact = dict(usage)
+            ctx_turns = 0
+            continue
         if not isinstance(payload, dict):
             continue
-        ts = str(event.get("timestamp") or "")
         if kind == "turn_context":
             model = payload.get("model")
             if payload.get("effort"):
                 effort = str(payload["effort"])
             if is_real_model(model):
                 turns += 1
+                ctx_turns += 1
                 if ts:
                     last_ts = ts
                 push_model(timeline, str(model), ts)
@@ -383,6 +435,11 @@ def scan_codex(path: Path) -> dict[str, Any]:
         "timeline": timeline, "model": timeline[-1]["model"] if timeline else "",
         "usage": usage, "turns": turns, "last_ts": last_ts, "cwd": cwd,
         "effort": effort, "context_window": context_window,
+        "compactions": compactions,
+        "usage_since_compact": (
+            {k: max(0, usage[k] - usage_at_compact.get(k, 0)) for k in usage}
+            if usage_at_compact is not None else None),
+        "turns_since_compact": ctx_turns if compactions else None,
     }
 
 
@@ -420,8 +477,12 @@ def collect_codex() -> list[dict[str, Any]]:
             if not prior["timeline"] or prior["timeline"][-1]["model"] != x["model"])
         if info["usage"]["output"] >= prior["usage"]["output"]:
             prior["usage"] = info["usage"]
+        known = {x["at"][:19] for x in prior["compactions"]}
+        prior["compactions"].extend(
+            x for x in info["compactions"] if x["at"][:19] not in known)
         # This file is newer (sorted), so its state is the current state.
-        for field in ("model", "effort", "cwd", "role", "nickname", "parent", "last_ts"):
+        for field in ("model", "effort", "cwd", "role", "nickname", "parent",
+                      "last_ts", "usage_since_compact", "turns_since_compact"):
             if info.get(field):
                 prior[field] = info[field]
         if info["age_s"] is not None and (
@@ -450,7 +511,7 @@ def collect_codex() -> list[dict[str, Any]]:
                 "tool_uses": None, "task": child["nickname"],
                 "age_s": child["age_s"], "live": child["live"], "size": child["size"],
             })
-        subs.sort(key=lambda s: (not s["live"], -(s["size"] or 0)))
+        subs.sort(key=live_first)
         sessions.append({
             "harness": "codex", "session_id": info["session_id"],
             "label": info["session_id"][:8],
@@ -459,6 +520,9 @@ def collect_codex() -> list[dict[str, Any]]:
             "model": info["model"], "timeline": info["timeline"],
             "usage": info["usage"], "turns": info["turns"],
             "last_ts": info["last_ts"], "age_s": info["age_s"], "live": info["live"],
+            "compactions": info["compactions"],
+            "usage_since_compact": info["usage_since_compact"],
+            "turns_since_compact": info["turns_since_compact"],
             "subagents": subs, "path": str(info["path"]),
         })
     return sessions
@@ -490,8 +554,7 @@ def collect() -> dict[str, Any]:
     for session in sessions:
         session["pids"] = pids.get(session["session_id"], [])
         session["switches"] = max(0, len(session["timeline"]) - 1)
-    sessions.sort(key=lambda s: (
-        not s["live"], s["age_s"] if s["age_s"] is not None else 1e18))
+    sessions.sort(key=live_first)
     return {
         "generated_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
         "live_window_s": LIVE_WINDOW_S,
@@ -548,6 +611,9 @@ border-color:color-mix(in srgb,var(--sub) 40%,transparent);color:var(--sub)}
 .pill{border:1px solid var(--line);padding:1px 7px;border-radius:10px;
 color:var(--dim);white-space:nowrap}
 .pill.warn{border-color:var(--warn);color:var(--warn)}
+.pill.on{border-color:var(--live);color:var(--live)}
+.pill.cmp{border-color:var(--sub);color:var(--sub)}
+.run{color:var(--live)}
 .grow{flex:1 1 auto}
 table{width:100%;border-collapse:collapse}
 th,td{text-align:left;padding:5px 12px;border-top:1px solid var(--line);
@@ -568,6 +634,7 @@ border-radius:4px;padding:3px 9px;cursor:pointer;font:inherit;font-size:12px}
   <span class="grow"></span>
   <select id="filter">
     <option value="live">live only</option>
+    <option value="active">active subagents</option>
     <option value="subs">has subagents</option>
     <option value="all" selected>all sessions</option>
   </select>
@@ -608,6 +675,31 @@ function timelineHTML(t){
   ).join(' <span class="muted">→</span> ') + '</div>';
 }
 
+// Compaction is the one event that invalidates every token total above it, so
+// it gets its own line rather than hiding in a tooltip.
+function compactHTML(s){
+  const c = s.compactions;
+  if(!c || !c.length) return '';
+  return '<div class="tl">compacted: ' + c.map(x =>
+    '<span class="sw">'+HHMM(x.at)+'</span>'
+    + (x.trigger?' <span class="muted">'+esc(x.trigger)+'</span>':'')
+    + (x.pre_tokens?' <span class="muted">context was '+K(x.pre_tokens)+'</span>':'')
+  ).join(' <span class="muted">→</span> ')
+  + ' <span class="muted">· totals below span the boundary</span></div>';
+}
+
+// `status` is the parent's launch record. It reads `async_launched` for every
+// backgrounded subagent and never flips to completed, so it cannot mean "done".
+// Only `completed` is terminal; otherwise the child transcript's mtime is the
+// only honest signal, and an idle one may be finished or abandoned.
+function STATE(s){
+  if(s.no_transcript) return '<span class="pill warn">no transcript</span>';
+  if(s.live) return '<span class="run">running</span>';
+  if(s.status === 'completed') return '<span class="muted">done</span>';
+  return '<span class="muted" title="launched in the background with no '
+    + 'completion record; transcript has been idle">idle</span>';
+}
+
 function subTable(subs){
   if(!subs.length) return '<div class="empty">no subagents</div>';
   let h = '<table><tr><th>subagent</th><th>role</th><th>model</th><th>state</th>'
@@ -622,8 +714,7 @@ function subTable(subs){
       + '<td><span class="model sm">'+esc(s.model||'unknown')+'</span>'
       +   (mism?' <span class="pill warn">rec '+esc(s.record_model)+'</span>':'')
       +   (s.timeline&&s.timeline.length>1?' <span class="pill warn">'+(s.timeline.length-1)+' sw</span>':'')+'</td>'
-      + '<td class="muted">'+(s.no_transcript?'<span class="pill warn">no transcript</span>'
-          :esc(s.status||(s.live?'running':'done')))+'</td>'
+      + '<td>'+STATE(s)+'</td>'
       + '<td class="num">'+K(s.turns)+'</td>'
       + '<td class="num">'+K(s.usage.output)+'</td>'
       + '<td class="num">'+K(s.usage.input)+'</td>'
@@ -639,6 +730,7 @@ function render(d){
   const mode = document.getElementById('filter').value;
   let list = d.sessions;
   if(mode === 'live') list = list.filter(s => s.live);
+  if(mode === 'active') list = list.filter(s => s.subagents.some(x => x.live));
   if(mode === 'subs') list = list.filter(s => s.subagents.length);
 
   const liveN = d.sessions.filter(s=>s.live).length;
@@ -652,6 +744,8 @@ function render(d){
   for(const s of list){
     const models = new Set(s.subagents.filter(x=>x.model).map(x=>x.model));
     const mixed = s.model && [...models].some(m => m !== s.model);
+    const act = s.subagents.filter(x=>x.live).length;
+    const since = s.usage_since_compact;
     const open = collapsed.has(s.session_id) ? '' : ' open';
     h += '<div class="s'+open+'" data-id="'+esc(s.session_id)+'">'
       + '<div class="shead"><span class="caret"></span>'
@@ -664,13 +758,23 @@ function render(d){
       + '<span class="pill">'+esc(s.project)+'</span>'
       + (s.branch?'<span class="pill">'+esc(s.branch)+'</span>':'')
       + '<span class="grow"></span>'
-      + (s.subagents.length?'<span class="pill'+(mixed?' warn':'')+'">'+s.subagents.length+' sub'
+      + (s.subagents.length?'<span class="pill'+(act?' on':mixed?' warn':'')+'">'
+          +(act?act+' active / ':'')+s.subagents.length+' sub'
           +(models.size>1?' · '+models.size+' models':'')+'</span>':'')
-      + '<span class="pill">out '+K(s.usage.output)+'</span>'
-      + '<span class="pill">'+s.turns+' turns</span>'
+      + (s.compactions&&s.compactions.length?'<span class="pill cmp" title="context '
+          +'compacted; token totals here span the boundary">compacted '
+          +HHMM(s.compactions[s.compactions.length-1].at)
+          +(s.compactions.length>1?' ×'+s.compactions.length:'')+'</span>':'')
+      + '<span class="pill"'+(since?' title="since last compaction / tail total"':'')
+          +'>out '+(since?K(since.output)+' / ':'')+K(s.usage.output)+'</span>'
+      + '<span class="pill"'+(s.turns_since_compact!=null
+          ?' title="since last compaction / tail total"':'')+'>'
+          +(s.turns_since_compact!=null?s.turns_since_compact+' / ':'')
+          +s.turns+' turns</span>'
       + (s.pids.length?'<span class="pill">pid '+s.pids.join(',')+'</span>':'')
       + '<span class="muted">'+AGE(s.age_s)+'</span>'
-      + '</div><div class="body">'+timelineHTML(s.timeline)+subTable(s.subagents)+'</div></div>';
+      + '</div><div class="body">'+timelineHTML(s.timeline)+compactHTML(s)
+      + subTable(s.subagents)+'</div></div>';
   }
   h = h || '<p class="muted">no sessions match this filter</p>';
   // Only touch the DOM when something actually changed, so a refresh mid-scroll
