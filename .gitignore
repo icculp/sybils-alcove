@@ -5,3 +5,6 @@ __pycache__/
 .env
 *.env
 !.env.example
+
+# Local design notes — in-repo for us, deliberately not published yet.
+DESIGN.md
