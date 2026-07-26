@@ -1,0 +1,20 @@
+<!doctype html>
+<html><head><meta charset="utf-8"><title>Sybil's Alcove — activity</title>
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<link rel="stylesheet" href="/static/app.css">
+<link rel="stylesheet" href="/static/activity.css"></head><body>
+<header>
+  <h1>SYBIL'S ALCOVE</h1>
+  <span class="muted">activity</span>
+  <span class="grow"></span>
+  <select id="range" aria-label="time range">
+    <option value="7">7 days</option>
+    <option value="30" selected>30 days</option>
+    <option value="90">90 days</option>
+    <option value="365">1 year</option>
+  </select>
+  <button id="table-toggle" aria-expanded="false">table view</button>
+  <a href="/" class="lnk">sessions &rarr;</a>
+</header>
+<div class="wrap viz-root" id="out"><p class="muted">loading…</p></div>
+<script type="module" src="/static/activity.js"></script></body></html>

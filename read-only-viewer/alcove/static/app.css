@@ -56,3 +56,4 @@ code{background:var(--bg);border:1px solid var(--line);border-radius:3px;padding
 button,select{background:var(--panel);color:var(--fg);border:1px solid var(--line);
 border-radius:4px;padding:3px 9px;cursor:pointer;font:inherit;font-size:12px}
 .tl{padding:0 12px 7px;font-size:12px;color:var(--dim)}
+.lnk{color:var(--acc);text-decoration:none;font-size:12px}

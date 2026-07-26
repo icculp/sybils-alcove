@@ -201,3 +201,25 @@ messages, not a served model — counting it invents phantom switches.
 Read-only, deliberately. It opens transcript files, never writes them, and never
 calls a model API. Driving sessions from here is a different tool with a
 different risk profile.
+
+## Activity view
+
+`/activity` charts daily turns and output tokens from the store, so it is not
+bounded by the tail window the session view reads. Populate the store first:
+
+```bash
+python3 alcove.py --ingest-only     # idempotent, cron-safe
+```
+
+Two charts rather than one with two y-axes: turns are in the hundreds and output
+tokens in the hundreds of thousands, and a dual axis would invite the reader to
+read a relationship out of scales that invented it.
+
+The output-token chart plots **Claude only**. Codex reports cumulative session
+totals, so no per-turn attribution exists; a flat-zero Codex series would imply it
+spent nothing rather than that the number is unavailable.
+
+Series colours are the two validated categorical slots, checked with a palette
+validator in both modes rather than chosen by eye. The page's own accent pair
+(blue/purple) is deliberately *not* used for data: it fails protanopia separation
+at ΔE 4.6, well under the ΔE 8 floor.
