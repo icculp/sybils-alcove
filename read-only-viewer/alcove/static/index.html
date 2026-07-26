@@ -1,0 +1,22 @@
+<!doctype html>
+<html><head><meta charset="utf-8"><title>Sybil's Alcove</title>
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<link rel="stylesheet" href="/static/app.css"></head><body>
+<header>
+  <h1>SYBIL'S ALCOVE</h1>
+  <span class="muted" id="stat">loading…</span>
+  <span class="grow"></span>
+  <select id="filter">
+    <option value="running">running (has process)</option>
+    <option value="live">running or writing</option>
+    <option value="active">active subagents</option>
+    <option value="subs">has subagents</option>
+    <option value="all" selected>all sessions</option>
+  </select>
+  <button id="expand">expand all</button>
+  <button id="collapse">collapse all</button>
+  <label class="muted"><input type="checkbox" id="auto" checked> auto 3s</label>
+  <button id="now">refresh</button>
+</header>
+<div class="wrap" id="out"></div>
+<script type="module" src="/static/app.js"></script></body></html>

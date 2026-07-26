@@ -11,6 +11,25 @@ python3 alcove.py          # http://127.0.0.1:8899
 
 No dependencies — Python 3.11+ stdlib only.
 
+## Layout
+
+```
+alcove.py           entrypoint only
+alcove/
+  config.py         environment settings
+  transcripts.py    reading JSONL off disk (tail/head/chronology)
+  model.py          the vocabulary both harnesses map into
+  sources/          one adapter per origin: claude, codex, process
+  collect.py        one snapshot across sources; decides session state
+  web.py            auth, static assets, JSON API
+  static/           index.html, app.css, app.js, login.html
+```
+
+`sources/` and `model.py` are pure functions over bytes, so they can be tested
+without a server — which is the point, because every bug this project has had was
+a field that parsed cleanly and meant something else. Adding a source (a hooks
+spool, OTEL, Codex's SQLite log) means adding a module, not editing existing ones.
+
 ## Why
 
 `claude agents --json` reports pid, cwd, and session id. Not the model, not
