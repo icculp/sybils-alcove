@@ -66,3 +66,19 @@ def cached() -> dict[str, Any]:
         _cache["data"] = collect()
         _cache["at"] = now
     return _cache["data"]
+
+
+def public(snapshot: dict[str, Any]) -> dict[str, Any]:
+    """The API payload: keys prefixed with `_` are ingest-only and stripped.
+
+    Per-turn rows exist so the store can key on them; shipping thousands of them
+    to a browser that polls every 3 seconds would be absurd.
+    """
+    def clean(obj: Any) -> Any:
+        if isinstance(obj, dict):
+            return {k: clean(v) for k, v in obj.items() if not k.startswith("_")}
+        if isinstance(obj, list):
+            return [clean(x) for x in obj]
+        return obj
+
+    return clean(snapshot)

@@ -30,8 +30,31 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from alcove.web import serve  # noqa: E402
 
+
+def ingest_once() -> int:
+    """Scan every transcript and write derived facts to the store, then exit.
+
+    Idempotent: the same scan run twice adds nothing the second time, because
+    every fact is keyed by a natural id. Safe to run from cron.
+    """
+    from alcove import store
+    from alcove.collect import collect
+
+    conn = store.connect()
+    counts = store.ingest(conn, collect())
+    total = store.totals(conn)
+    print(f"store: {store.db_path()}")
+    print("  changed:  " + ", ".join(f"{k}={v}" for k, v in counts.items() if v))
+    print(f"  lifetime: {total['turns']} turns, {total['output']} output tokens,"
+          f" {total['sessions']} sessions")
+    print(f"  span:     {total['first_ts']} .. {total['last_ts']}")
+    return 0
+
+
 if __name__ == "__main__":
     try:
+        if "--ingest-only" in sys.argv:
+            raise SystemExit(ingest_once())
         raise SystemExit(serve())
     except KeyboardInterrupt:
         raise SystemExit(130) from None

@@ -25,6 +25,7 @@ def scan_codex(path: Path) -> dict[str, Any]:
     session — summing them would multiply-count.
     """
     timeline: list[dict[str, str]] = []
+    turn_rows: list[dict[str, Any]] = []
     usage = new_usage()
     turns = ctx_turns = 0
     compactions: list[dict[str, Any]] = []
@@ -92,6 +93,16 @@ def scan_codex(path: Path) -> dict[str, Any]:
             ctx_turns += 1
             if ts:
                 last_ts = ts
+            # Codex token totals are cumulative session snapshots, so there is
+            # no per-turn attribution to record — the columns stay NULL rather
+            # than being filled with a number that would not mean what it says.
+            turn_rows.append({
+                "id": str(payload.get("id") or "") or f"{path.name}:{ts}",
+                "ts": ts,
+                "model": timeline[-1]["model"] if timeline else "",
+                "input": None, "output": None,
+                "cache_read": None, "cache_write": None,
+            })
         elif kind == "event_msg" and payload.get("type") == "token_count":
             info = payload.get("info")
             if not isinstance(info, dict):
@@ -111,6 +122,7 @@ def scan_codex(path: Path) -> dict[str, Any]:
     return {
         "session_id": sid, "parent": parent, "role": role, "nickname": nickname,
         "timeline": timeline, "model": timeline[-1]["model"] if timeline else "",
+        "turn_rows": turn_rows,
         "usage": usage, "turns": turns, "last_ts": last_ts, "cwd": cwd,
         "effort": effort, "context_window": context_window,
         "compactions": compactions,
@@ -149,6 +161,7 @@ def collect_codex() -> list[dict[str, Any]]:
             continue
         prior["size"] += info["size"]
         prior["turns"] += info["turns"]
+        prior["turn_rows"].extend(info["turn_rows"])
         prior["timeline"].extend(
             x for x in info["timeline"]
             if not prior["timeline"] or prior["timeline"][-1]["model"] != x["model"])
@@ -189,6 +202,7 @@ def collect_codex() -> list[dict[str, Any]]:
                 "tool_uses": None, "task": child["nickname"],
                 "age_s": child["age_s"], "live": child["live"],
                 "size": child["size"],
+                "_turn_rows": child["turn_rows"],
             })
         subs.sort(key=live_first)
         sessions.append({
@@ -209,5 +223,6 @@ def collect_codex() -> list[dict[str, Any]]:
             "usage_since_compact": info["usage_since_compact"],
             "turns_since_compact": info["turns_since_compact"],
             "subagents": subs, "path": str(info["path"]),
+            "_turn_rows": info["turn_rows"],
         })
     return sessions

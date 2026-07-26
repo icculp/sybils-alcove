@@ -22,6 +22,7 @@ from ..transcripts import file_size, chronological, mtime_age, tail_events
 
 def scan_claude(path: Path, *, main_thread_only: bool) -> dict[str, Any]:
     timeline: list[dict[str, str]] = []
+    turn_rows: list[dict[str, Any]] = []
     selections: list[dict[str, str]] = []
     pending_args = ""
     usage = new_usage()
@@ -96,9 +97,25 @@ def scan_claude(path: Path, *, main_thread_only: bool) -> dict[str, Any]:
         if first:
             turns += 1
             ctx_turns += 1
+            # One row per real turn, for the store. Keyed by message.id so a
+            # re-scan of overlapping windows is a no-op; when an event carries no
+            # id, path+timestamp is still stable across re-scans.
+            u = message.get("usage") or {}
+            turn_rows.append({
+                "id": msg_id or f"{path.name}:{ts}",
+                "ts": ts, "model": str(model),
+                "input": int(u.get("input_tokens") or 0),
+                "output": int(u.get("output_tokens") or 0),
+                "cache_read": int(u.get("cache_read_input_tokens") or 0),
+                "cache_write": int(u.get("cache_creation_input_tokens") or 0),
+            })
         push_model(timeline, str(model), ts)
     return {
         "timeline": timeline, "model": timeline[-1]["model"] if timeline else "",
+        # Per-turn rows are for the store only and are stripped from the API
+        # payload; usage on a `<synthetic>`-model message is counted in the
+        # totals above but has no row, since it is not a turn.
+        "turn_rows": turn_rows,
         # What the operator chose, vs what actually served a turn. These are
         # different facts and a mismatch is meaningful, so keep both.
         "selections": selections,
@@ -166,6 +183,7 @@ def collect_claude() -> list[dict[str, Any]]:
                     "age_s": age,
                     "live": age is not None and age < config.LIVE_WINDOW_S,
                     "size": file_size(child),
+                    "_turn_rows": child_info["turn_rows"],
                 })
             # A record with no transcript is still a spawn that happened.
             seen = {s["id"] for s in subs}
@@ -200,5 +218,6 @@ def collect_claude() -> list[dict[str, Any]]:
                 "usage_since_compact": info["usage_since_compact"],
                 "turns_since_compact": info["turns_since_compact"],
                 "subagents": subs, "path": str(transcript),
+                "_turn_rows": info["turn_rows"],
             })
     return sessions
