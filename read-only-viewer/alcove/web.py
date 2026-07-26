@@ -13,7 +13,7 @@ from typing import Any
 from urllib.parse import parse_qs
 
 from . import config
-from .collect import cached
+from .collect import cached, public
 
 _TYPES = {".html": "text/html; charset=utf-8", ".css": "text/css; charset=utf-8",
           ".js": "text/javascript; charset=utf-8"}
@@ -112,7 +112,8 @@ class Handler(BaseHTTPRequestHandler):
             if route in ("/", "/index.html", "/login"):
                 self._send(_asset("index.html"), _TYPES[".html"])
             elif route == "/api/sessions":
-                self._send(json.dumps(cached()).encode(), "application/json")
+                self._send(json.dumps(public(cached())).encode(),
+                           "application/json")
             elif route.startswith("/static/"):
                 name = route[len("/static/"):]
                 suffix = name[name.rfind("."):] if "." in name else ""
