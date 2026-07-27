@@ -15,6 +15,7 @@ from urllib.parse import parse_qs
 from . import config
 from .collect import cached, public
 from . import store
+from .spill import spill
 
 _TYPES = {".html": "text/html; charset=utf-8", ".css": "text/css; charset=utf-8",
           ".js": "text/javascript; charset=utf-8"}
@@ -47,6 +48,20 @@ def _activity(path: str) -> dict[str, Any]:
                 "totals": store.totals(conn), "db": str(store.db_path())}
     finally:
         conn.close()
+
+
+def _spill(path: str) -> dict[str, Any]:
+    """Recent events for one session or subagent, resolved by id, never by path."""
+    query = parse_qs(path.split("?", 1)[1]) if "?" in path else {}
+    one = lambda k, d="": (query.get(k) or [d])[0]  # noqa: E731
+    def number(key: str, default: int, low: int, high: int) -> int:
+        try:
+            return max(low, min(high, int(one(key, str(default)))))
+        except ValueError:
+            return default
+    return spill(one("session"), one("agent"),
+                 minutes=number("minutes", 0, 0, 1440),
+                 limit=number("limit", 300, 1, 2000))
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -119,7 +134,7 @@ class Handler(BaseHTTPRequestHandler):
         route = self.path.split("?", 1)[0]
         # Loopback is trusted; anything wider requires the shared secret.
         if not config.is_local_bind() and not token_ok(self._supplied_token()):
-            if route == "/api/sessions":
+            if route.startswith("/api/"):
                 self._send(b'{"error":"unauthorized"}', "application/json", status=401)
             else:
                 self._login_page(status=401)
@@ -133,6 +148,11 @@ class Handler(BaseHTTPRequestHandler):
                            "application/json")
             elif route == "/activity":
                 self._send(_asset("activity.html"), _TYPES[".html"])
+            elif route == "/api/spill":
+                self._send(json.dumps(_spill(self.path)).encode(),
+                           "application/json")
+            elif route == "/spill":
+                self._send(_asset("spill.html"), _TYPES[".html"])
             elif route == "/api/sessions":
                 self._send(json.dumps(public(cached())).encode(),
                            "application/json")

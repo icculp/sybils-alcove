@@ -1,0 +1,54 @@
+/* The stream. A left rail carries the kind so the eye can scan down one column
+   and find "where did it call a tool" without reading any prose. */
+.ev{display:grid;grid-template-columns:64px 92px 1fr;gap:10px;padding:5px 12px;
+  border-bottom:1px solid color-mix(in srgb,var(--line) 55%,transparent);
+  align-items:baseline}
+.ev:last-child{border-bottom:0}
+.ev .t{color:var(--dim);font-size:11px;font-variant-numeric:tabular-nums}
+.ev .k{font-size:10px;text-transform:uppercase;letter-spacing:.5px;font-weight:600}
+.ev .c{min-width:0}
+
+.ev.assistant .k{color:var(--acc)}
+.ev.user .k{color:var(--live)}
+.ev.tool_use .k{color:var(--sub)}
+.ev.tool_result .k{color:var(--dim)}
+.ev.reasoning .k{color:var(--dim)}
+.ev.compact .k{color:var(--warn)}
+.ev.err .k{color:var(--warn)}
+
+/* Text keeps transcript newlines but does not wrap by default: a wrapped 4000
+   character tool result buries everything after it. The header has a toggle. */
+/* No single event may eat the viewport. A pasted script or a long file dump is
+   clamped and scrolls inside its own box, so the stream stays scannable and
+   nothing is actually hidden. The clamp is a whole number of lines (1.5em is one
+   line here): a fractional height slices a row of glyphs in half and reads as a
+   broken render rather than as "there is more, scroll". */
+.ev .c pre,.ev .args{max-height:calc(1.5em * 7);overflow:auto}
+.ev .c pre{margin:0;white-space:pre;overflow-x:auto;font:inherit}
+body.wrap .ev .c pre{white-space:pre-wrap;overflow-wrap:anywhere}
+.ev.assistant .c pre{color:var(--fg)}
+.ev.tool_result .c pre,.ev.user .c pre{color:var(--dim)}
+
+.tool{display:flex;gap:8px;align-items:baseline;flex-wrap:wrap}
+.tool b{color:var(--sub);font-weight:600}
+.args{color:var(--dim);min-width:0;overflow-x:auto;white-space:pre}
+.ev .cut{color:var(--warn);font-size:10px;letter-spacing:.4px;margin-left:6px}
+
+/* Reasoning is a marker, not content — the text does not exist on disk. Styled
+   as an absence so it never reads as an empty message. */
+.ev.reasoning .c{color:var(--idle);font-style:italic;font-size:11px}
+
+.bar{display:flex;gap:10px;align-items:baseline;flex-wrap:wrap;margin-bottom:10px;
+  color:var(--dim);font-size:12px}
+.note{border:1px solid var(--line);border-left:2px solid var(--warn);
+  background:var(--panel);padding:7px 11px;border-radius:4px;margin-bottom:10px;
+  color:var(--dim);font-size:12px}
+.stream{background:var(--panel);border:1px solid var(--line);border-radius:6px;
+  overflow:hidden}
+.lnk{color:var(--acc);text-decoration:none;font-size:12px}
+.grow{flex:1}
+
+/* Argument keys are dimmer than their values: you scan for the path, not for
+   the word "file_path". */
+.args .a{margin-right:12px}
+.args .a i{color:var(--idle);font-style:normal}
