@@ -184,6 +184,7 @@ def collect_claude() -> list[dict[str, Any]]:
                     "live": age is not None and age < config.LIVE_WINDOW_S,
                     "size": file_size(child),
                     "_turn_rows": child_info["turn_rows"],
+                    "_path": str(child),
                 })
             # A record with no transcript is still a spawn that happened.
             seen = {s["id"] for s in subs}

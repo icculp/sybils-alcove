@@ -203,6 +203,7 @@ def collect_codex() -> list[dict[str, Any]]:
                 "age_s": child["age_s"], "live": child["live"],
                 "size": child["size"],
                 "_turn_rows": child["turn_rows"],
+                "_path": str(child["path"]),
             })
         subs.sort(key=live_first)
         sessions.append({

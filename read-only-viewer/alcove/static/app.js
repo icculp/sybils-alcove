@@ -99,11 +99,20 @@ function STATE(s){
     + 'completion record; transcript has been idle">idle</span>';
 }
 
-function subTable(subs){
+// A subagent with no transcript has nothing to stream, so it gets no link
+// rather than a link to an empty page.
+function spillLink(sid, agent){
+  const q = '/spill?session='+encodeURIComponent(sid)
+          + (agent?'&agent='+encodeURIComponent(agent):'');
+  return '<a class="lnk spill" href="'+q+'">spill</a>';
+}
+
+function subTable(subs, sid){
   if(!subs.length) return '<div class="empty">no subagents</div>';
   let h = '<table><tr><th>subagent</th><th>role</th><th>model</th><th>state</th>'
         + '<th class="num">turns</th><th class="num">out</th><th class="num">in</th>'
-        + '<th class="num">cache rd</th><th class="num">age</th><th>task</th></tr>';
+        + '<th class="num">cache rd</th><th class="num">age</th><th>task</th>'
+        + '<th></th></tr>';
   for(const s of subs){
     const mism = s.record_model && s.model && s.record_model !== s.model;
     h += '<tr>'
@@ -119,7 +128,8 @@ function subTable(subs){
       + '<td class="num">'+K(s.usage.input)+'</td>'
       + '<td class="num muted">'+K(s.usage.cache_read)+'</td>'
       + '<td class="num muted">'+AGE(s.age_s)+'</td>'
-      + '<td class="t">'+esc(s.task||'')+'</td></tr>';
+      + '<td class="t">'+esc(s.task||'')+'</td>'
+      + '<td>'+(s.no_transcript?'':spillLink(sid, s.id))+'</td></tr>';
   }
   return h + '</table>';
 }
@@ -185,8 +195,9 @@ function render(d){
           +s.turns+' turns</span>'
       + (s.pids.length?'<span class="pill">pid '+s.pids.join(',')+'</span>':'')
       + '<span class="muted">'+AGE(s.age_s)+'</span>'
+      + spillLink(s.session_id,'')
       + '</div><div class="body">'+selectionHTML(s)+timelineHTML(s.timeline)
-      + compactHTML(s)+subTable(s.subagents)+'</div></div>';
+      + compactHTML(s)+subTable(s.subagents, s.session_id)+'</div></div>';
   }
   h = h || '<p class="muted">no sessions match this filter</p>';
   // Only touch the DOM when something actually changed, so a refresh mid-scroll
@@ -195,8 +206,9 @@ function render(d){
     document.getElementById('out').innerHTML = h;
     last = h;
     for(const el of document.querySelectorAll('.s')){
+      // The header carries a link; clicking it must navigate, not collapse.
       el.querySelector('.shead').addEventListener('click',
-        () => toggle(el.dataset.id, el));
+        ev => { if(!ev.target.closest('a')) toggle(el.dataset.id, el); });
     }
   }
 }
