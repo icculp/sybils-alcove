@@ -65,8 +65,16 @@ function selectionHTML(s){
 // A transcript on disk is not a session. `running` means a live process owns the
 // session id; everything else is weaker evidence and is labelled as such.
 const DOT = {running:'live', writing:'warn', ended:'idle', unknown:'unk'};
+// A running session that has not written in the live window is still running —
+// the process is there — but it is not working. Solid green is reserved for a
+// session that is actually moving; quiet ones get a hollow ring, so an
+// abandoned terminal open since yesterday stops competing for attention.
+const DOTCLS = s => DOT[s.state] + (s.quiet ? ' quiet' : '');
 function STATE_WHY(s){
-  if(s.state === 'running') return 'process alive: pid '+s.pids.join(', ');
+  if(s.state === 'running') return s.quiet
+    ? 'process alive (pid '+s.pids.join(', ')+') but the transcript has not '
+      + 'moved in the live window — open, not working'
+    : 'process alive: pid '+s.pids.join(', ');
   if(s.state === 'unknown') return 'pid lookup failed — absence proves nothing';
   if(s.state === 'writing') return s.state_inferred
     ? 'no per-session pid for this harness; transcript written recently'
@@ -147,9 +155,14 @@ function render(d){
   const subs = d.sessions.reduce((a,s)=>a+s.subagents.length,0);
   const subsLive = d.sessions.reduce((a,s)=>a+s.subagents.filter(x=>x.live).length,0);
   const running = d.sessions.filter(s=>s.state==='running').length;
+  // Headline the ones actually moving; a count that lumps in six day-old
+  // terminals is the same lie the solid green dot was telling.
+  const busy = d.sessions.filter(s=>s.state==='running'&&!s.quiet).length;
+  const quiet = running - busy;
   const bad = d.pid_source && d.pid_source !== 'ok';
   document.getElementById('stat').innerHTML =
-    esc(d.generated_at)+' · <b>'+running+' running</b> / '+liveN+' writing / '
+    esc(d.generated_at)+' · <b>'+busy+' running</b>'
+    +(quiet?' <span class="muted">(+'+quiet+' quiet)</span>':'')+' / '+liveN+' writing / '
     +d.sessions.length+' transcripts · '+subsLive+' active / '+subs+' subagents'
     +(d.codex_processes!=null?' · '+d.codex_processes+' codex proc':'')
     +(bad?' · <span class="warnx">pid lookup '+esc(d.pid_source)+'</span>':'');
@@ -163,9 +176,9 @@ function render(d){
     const open = collapsed.has(s.session_id) ? '' : ' open';
     h += '<div class="s'+open+'" data-id="'+esc(s.session_id)+'">'
       + '<div class="shead"><span class="caret"></span>'
-      + '<span class="dot '+DOT[s.state]+'" title="'+STATE_WHY(s)+'"></span>'
+      + '<span class="dot '+DOTCLS(s)+'" title="'+STATE_WHY(s)+'"></span>'
       + '<span class="hz">'+esc(s.harness)+'</span>'
-      + '<span class="st '+DOT[s.state]+'">'+s.state
+      + '<span class="st '+DOTCLS(s)+'">'+s.state+(s.quiet?' · quiet':'')
       +   (s.state_inferred&&s.state!=='ended'?'?':'')+'</span>'
       + '<span class="sid">'+esc(s.label)+'</span>'
       + (s.agent_name?'<span class="nm" title="the CLI\'s name for this window'

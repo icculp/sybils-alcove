@@ -26,8 +26,6 @@ from pathlib import Path
 from typing import Any, Iterable
 
 SCHEMA = """
-PRAGMA journal_mode=WAL;
-
 CREATE TABLE IF NOT EXISTS turn (
   id          TEXT PRIMARY KEY,
   session_id  TEXT NOT NULL,
@@ -103,13 +101,61 @@ def db_path() -> Path:
     return (base / "alcove" / "alcove.db").expanduser()
 
 
-def connect(path: Path | None = None) -> sqlite3.Connection:
+class StoreUnavailable(RuntimeError):
+    """The store cannot be read — usually because nothing has ingested yet."""
+
+
+def connect(path: Path | None = None, *, write: bool = False) -> sqlite3.Connection:
+    """Open the store. Read-only unless a writer explicitly asks otherwise.
+
+    The server must never open this read-write. It runs under a unit that sets
+    `ProtectHome=read-only`, because serving a page needs no write access — and
+    a read-write open there fails with "unable to open database file", which
+    surfaced as the whole request dying rather than as an error. Creating the
+    schema is likewise a writer's job: a reader that creates an empty database
+    on a typo'd path reports "no data" instead of "wrong path".
+    """
     target = path or db_path()
-    target.parent.mkdir(parents=True, exist_ok=True)
-    conn = sqlite3.connect(target, timeout=10)
-    conn.row_factory = sqlite3.Row
-    conn.executescript(SCHEMA)
-    return conn
+    if write:
+        target.parent.mkdir(parents=True, exist_ok=True)
+        conn = sqlite3.connect(target, timeout=10)
+        conn.row_factory = sqlite3.Row
+        # NOT WAL, deliberately. A read-only connection to a WAL database has to
+        # create a `-shm` file, which needs write permission on the DIRECTORY —
+        # so WAL silently requires every reader to be a writer, and the hardened
+        # unit (ProtectHome=read-only) fails with "unable to open database file".
+        # WAL's payoff is concurrent readers during a write; this store has one
+        # periodic writer and a viewer that polls, so a rollback journal costs
+        # nothing and keeps the server needing no write access at all.
+        # Checkpoint first: converting out of WAL fails while another connection
+        # is attached, and the pragma reports that failure by returning the mode
+        # it left in place rather than by raising. Read it back and surface it.
+        try:
+            conn.execute("pragma wal_checkpoint(TRUNCATE)")
+        except sqlite3.Error:
+            pass  # not in WAL, nothing to checkpoint
+        mode = (conn.execute("pragma journal_mode=DELETE").fetchone() or [""])[0]
+        if str(mode).lower() != "delete":
+            print(f"warning: store journal_mode is {mode!r}, not 'delete'. A "
+                  f"read-only reader (the server under ProtectHome=read-only) "
+                  f"cannot open a WAL database. Re-run with nothing else "
+                  f"attached to convert it.")
+        conn.executescript(SCHEMA)
+        return conn
+    if not target.exists():
+        raise StoreUnavailable(f"no store at {target}")
+    try:
+        # mode=ro also means a reader can never create the file by accident.
+        conn = sqlite3.connect(f"file:{target}?mode=ro", uri=True, timeout=10)
+        conn.row_factory = sqlite3.Row
+        return conn
+    except sqlite3.Error as err:
+        # The likeliest cause of a failed read-only open on a file that exists:
+        # the database is still in WAL mode from an older build, and this
+        # process cannot write the directory to create its `-shm`.
+        raise StoreUnavailable(
+            f"{err} (if the store predates the rollback-journal change, one "
+            f"`python3 alcove.py --ingest-only` converts it)") from err
 
 
 # ------------------------------------------------------------------ ingestion

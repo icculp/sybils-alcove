@@ -47,6 +47,12 @@ def collect() -> dict[str, Any]:
         # Codex has no per-session pid, so its transcript freshness is the only
         # signal available — mark it inferred rather than implying certainty.
         session["state_inferred"] = session["harness"] != "claude"
+        # A process can own a session for a day without the model writing a word.
+        # "running" then means the window is open, NOT that work is happening,
+        # and rendering it the same as a session mid-turn makes every abandoned
+        # terminal look busy. Codex never looked wrong here only because it has
+        # no pid to hold it green.
+        session["quiet"] = session["state"] == "running" and not session["live"]
     sessions.sort(key=lambda s: (_RANK.get(s["state"], 9),
                                  s["age_s"] if s["age_s"] is not None else 1e18))
     return {

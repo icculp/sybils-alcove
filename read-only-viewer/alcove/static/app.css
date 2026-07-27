@@ -59,3 +59,7 @@ border-radius:4px;padding:3px 9px;cursor:pointer;font:inherit;font-size:12px}
 .lnk{color:var(--acc);text-decoration:none;font-size:12px}
 a.lnk.spill{margin-left:8px;font-size:11px;opacity:.75}
 a.lnk.spill:hover{opacity:1;text-decoration:underline}
+/* Quiet = a process owns the session but nothing has been written in the live
+   window. Hollow ring, not a filled dot: present, not working. */
+.dot.live.quiet{background:transparent;border:1.5px solid var(--live);box-shadow:none}
+.st.live.quiet{color:var(--idle)}
