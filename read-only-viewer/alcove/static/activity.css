@@ -1,0 +1,61 @@
+/* Chart tokens. Series colors are the validated categorical slots 1-2 (blue,
+   orange); both modes were checked with the palette validator rather than eyeballed
+   — the page's own accent pair (blue/purple) FAILS protanopia separation at
+   deltaE 4.6, so it is deliberately not used for data. */
+.viz-root{
+  --series-1:#2a78d6;          /* claude */
+  --series-2:#eb6834;          /* codex  */
+  --viz-surface:var(--panel);
+  --viz-grid:var(--line);
+}
+@media (prefers-color-scheme:dark){
+  /* Dark is selected, not an automatic flip: the same two hues re-stepped for
+     the dark surface so they stay inside the L 0.48-0.67 band. */
+  .viz-root{--series-1:#3987e5; --series-2:#d95926}
+}
+
+.card{background:var(--panel);border:1px solid var(--line);border-radius:6px;
+  padding:14px 16px 10px;margin-bottom:12px}
+.card h2{font-size:12px;margin:0 0 2px;font-weight:600;letter-spacing:.4px;
+  text-transform:uppercase}
+.card p.sub{margin:0 0 10px;font-size:12px;color:var(--dim)}
+
+/* Stat tiles: proportional figures, not tabular-nums — equal-width digits make a
+   big number look loose. */
+.tiles{display:flex;gap:12px;flex-wrap:wrap;margin-bottom:12px}
+.tile{background:var(--panel);border:1px solid var(--line);border-radius:6px;
+  padding:12px 16px;min-width:150px;flex:1 1 150px}
+.tile .v{font-size:24px;font-weight:600;line-height:1.15;
+  font-variant-numeric:proportional-nums}
+.tile .k{font-size:11px;color:var(--dim);text-transform:uppercase;
+  letter-spacing:.5px;margin-top:2px}
+
+/* Legend: identity never rests on color alone, so it is always present for two
+   or more series and the text stays in ink tokens. */
+.legend{display:flex;gap:14px;align-items:center;font-size:12px;
+  color:var(--dim);margin:0 0 8px}
+.legend .key{display:inline-flex;gap:6px;align-items:center}
+.legend .sw{width:10px;height:10px;border-radius:2px;display:inline-block}
+
+svg{display:block;width:100%;height:auto}
+.grid line{stroke:var(--viz-grid);stroke-width:1}   /* hairline, solid */
+.tick{fill:var(--dim);font-size:10px;font-variant-numeric:tabular-nums}
+.dlabel{fill:var(--fg);font-size:10px;font-weight:600}
+.col{cursor:default}
+.col:hover .hit{fill:color-mix(in srgb,var(--fg) 7%,transparent)}
+
+.tip{position:fixed;pointer-events:none;z-index:20;background:var(--bg);
+  border:1px solid var(--line);border-radius:5px;padding:6px 9px;font-size:12px;
+  box-shadow:0 3px 12px rgba(0,0,0,.35);display:none;white-space:nowrap}
+.tip b{font-weight:600}
+.tip .r{display:flex;gap:8px;align-items:center;color:var(--dim)}
+.tip .r .sw{width:8px;height:8px;border-radius:2px}
+.tip .r .n{margin-left:auto;color:var(--fg);font-variant-numeric:tabular-nums}
+
+table.data{width:100%;border-collapse:collapse;font-size:12px}
+table.data th,table.data td{border-top:1px solid var(--line);padding:4px 10px;
+  text-align:right;white-space:nowrap}
+table.data th:first-child,table.data td:first-child{text-align:left}
+table.data td{font-variant-numeric:tabular-nums}
+.lnk{color:var(--acc);text-decoration:none;font-size:12px}
+.hidden{display:none}

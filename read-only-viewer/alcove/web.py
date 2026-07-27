@@ -14,6 +14,7 @@ from urllib.parse import parse_qs
 
 from . import config
 from .collect import cached, public
+from . import store
 
 _TYPES = {".html": "text/html; charset=utf-8", ".css": "text/css; charset=utf-8",
           ".js": "text/javascript; charset=utf-8"}
@@ -30,6 +31,22 @@ def _asset(name: str) -> bytes:
     if not str(target).startswith(str(config.STATIC_DIR.resolve())):
         raise FileNotFoundError(name)
     return target.read_bytes()
+
+
+def _activity(path: str) -> dict[str, Any]:
+    """Daily history from the store — not bounded by the tail window the live
+    view reads, which is the whole reason the store exists."""
+    query = parse_qs(path.split("?", 1)[1]) if "?" in path else {}
+    try:
+        days = max(1, min(365, int((query.get("days") or ["30"])[0])))
+    except ValueError:
+        days = 30
+    conn = store.connect()
+    try:
+        return {"days": days, "rows": store.daily_activity(conn, days),
+                "totals": store.totals(conn), "db": str(store.db_path())}
+    finally:
+        conn.close()
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -111,6 +128,11 @@ class Handler(BaseHTTPRequestHandler):
         try:
             if route in ("/", "/index.html", "/login"):
                 self._send(_asset("index.html"), _TYPES[".html"])
+            elif route == "/api/activity":
+                self._send(json.dumps(_activity(self.path)).encode(),
+                           "application/json")
+            elif route == "/activity":
+                self._send(_asset("activity.html"), _TYPES[".html"])
             elif route == "/api/sessions":
                 self._send(json.dumps(public(cached())).encode(),
                            "application/json")
