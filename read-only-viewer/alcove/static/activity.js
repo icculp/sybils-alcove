@@ -206,9 +206,13 @@ async function load() {
     if (!r.ok) throw new Error('HTTP ' + r.status);
     const d = await r.json();
     if (!d.rows.length) {
-      document.getElementById('out').innerHTML =
-        '<p class="muted">The store is empty. Populate it with '
-        + '<code>python3 alcove.py --ingest-only</code>.</p>';
+      // "Unreadable" and "empty" are different problems with different fixes,
+      // so say which one this is instead of always blaming an empty store.
+      document.getElementById('out').innerHTML = d.unavailable
+        ? `<p class="muted">Store unavailable: ${esc(d.unavailable)}<br>`
+          + `${esc(d.hint || '')}</p>`
+        : '<p class="muted">The store is empty. Populate it with '
+          + '<code>python3 alcove.py --ingest-only</code>.</p>';
       return;
     }
     render(d);

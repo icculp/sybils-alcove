@@ -40,7 +40,7 @@ def ingest_once() -> int:
     from alcove import store
     from alcove.collect import collect
 
-    conn = store.connect()
+    conn = store.connect(write=True)
     counts = store.ingest(conn, collect())
     total = store.totals(conn)
     print(f"store: {store.db_path()}")

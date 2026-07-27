@@ -8,6 +8,8 @@ from __future__ import annotations
 
 import hmac
 import json
+import sqlite3
+import traceback
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any
 from urllib.parse import parse_qs
@@ -42,10 +44,23 @@ def _activity(path: str) -> dict[str, Any]:
         days = max(1, min(365, int((query.get("days") or ["30"])[0])))
     except ValueError:
         days = 30
-    conn = store.connect()
+    try:
+        conn = store.connect()
+    except store.StoreUnavailable as err:
+        # A missing store is an expected state on a fresh install, not a fault:
+        # say how to populate it instead of returning an error the page cannot act on.
+        return {"days": days, "rows": [], "totals": {}, "db": str(store.db_path()),
+                "unavailable": str(err),
+                "hint": "populate it with:  python3 alcove.py --ingest-only"}
     try:
         return {"days": days, "rows": store.daily_activity(conn, days),
                 "totals": store.totals(conn), "db": str(store.db_path())}
+    except sqlite3.Error as err:
+        # A database that exists but has no schema yet reads the same as one
+        # that was never populated.
+        return {"days": days, "rows": [], "totals": {}, "db": str(store.db_path()),
+                "unavailable": str(err),
+                "hint": "populate it with:  python3 alcove.py --ingest-only"}
     finally:
         conn.close()
 
@@ -167,6 +182,16 @@ class Handler(BaseHTTPRequestHandler):
                 self.send_error(404)
         except (FileNotFoundError, OSError):
             self.send_error(404)
+        except Exception:  # noqa: BLE001
+            # Anything unhandled used to escape into ThreadingHTTPServer, which
+            # drops the socket — the browser sees "failed to fetch" with no
+            # status and no clue. Log the trace, answer with one.
+            traceback.print_exc()
+            if route.startswith("/api/"):
+                self._send(b'{"error":"internal error; see server log"}',
+                           "application/json", status=500)
+            else:
+                self.send_error(500)
 
     def log_message(self, *args: Any) -> None:
         return  # a poll every 3s would drown the console
