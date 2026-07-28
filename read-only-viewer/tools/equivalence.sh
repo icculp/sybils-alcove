@@ -33,11 +33,19 @@ tmp="$(mktemp -d)"
 trap 'rm -rf "$tmp"' EXIT
 
 python3 tools/canonical.py > "$tmp/py.json"
-./rs/target/release/alcove   > "$tmp/rs.json"
+./rs/target/release/alcove --snapshot > "$tmp/rs.json"
 
 if diff -q "$tmp/py.json" "$tmp/rs.json" > /dev/null; then
   n=$(python3 -c "import json,sys;print(len(json.load(open('$tmp/py.json'))['sessions']))")
   echo "PASS — byte-identical over $n sessions"
+
+  # Second property: the incremental (warm) path must agree with a cold full
+  # rescan. A stale cache entry would otherwise hide events silently, and the
+  # cross-implementation diff above cannot see it — both --snapshot runs are cold.
+  a="$(./rs/target/release/alcove --snapshot)"
+  b="$(./rs/target/release/alcove --snapshot)"
+  [ "$a" = "$b" ] || { echo "FAIL — snapshot not deterministic"; exit 1; }
+  echo "PASS — snapshot deterministic across runs"
   exit 0
 fi
 

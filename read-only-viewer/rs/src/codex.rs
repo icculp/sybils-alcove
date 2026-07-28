@@ -11,8 +11,10 @@ use std::path::{Path, PathBuf};
 use serde_json::Value;
 
 use crate::model::{is_real_model, push_model, Compaction, ModelAt, Usage};
+use crate::cache::ScanCache;
 use crate::transcripts::{chronological, file_size, head_events, tail_events};
 
+#[derive(Clone)]
 pub struct Scan {
     pub session_id: String,
     pub parent: String,
@@ -224,7 +226,7 @@ fn walk_jsonl(root: &Path, out: &mut Vec<PathBuf>) {
     }
 }
 
-pub fn collect(root: &Path) -> Vec<Session> {
+pub fn collect(root: &Path, cache: &ScanCache<Scan>) -> Vec<Session> {
     let mut sessions = Vec::new();
     if !root.is_dir() {
         return sessions;
@@ -237,7 +239,7 @@ pub fn collect(root: &Path) -> Vec<Session> {
 
     // Rollouts are independent files; scan them across cores, then merge
     // sequentially so the newest-file-wins ordering is unchanged.
-    let scans = crate::par::pmap(paths, |p| scan(p));
+    let scans = crate::par::pmap(paths, |p| cache.get_or_scan(p, || scan(p)));
 
     let mut merged: Vec<Scan> = Vec::new();
     let mut index: HashMap<String, usize> = HashMap::new();

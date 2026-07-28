@@ -11,11 +11,16 @@
 //! What remains is exactly the parsing facts, which is what a port can get
 //! wrong.
 
+mod cache;
 mod claude;
 mod codex;
+mod collect;
+mod config;
 mod model;
 mod par;
+mod process;
 mod transcripts;
+mod web;
 
 use std::path::PathBuf;
 
@@ -65,12 +70,17 @@ fn env_path(key: &str, default: PathBuf) -> PathBuf {
 }
 
 fn main() {
+    // `--snapshot` emits the canonical form the equivalence gate diffs against;
+    // with no arguments the binary serves.
+    if !std::env::args().any(|a| a == "--snapshot") {
+        std::process::exit(web::serve(config::Config::from_env()));
+    }
     let claude_root = env_path("ALCOVE_CLAUDE_ROOT", home().join(".claude/projects"));
     let codex_root = env_path("ALCOVE_CODEX_ROOT", home().join(".codex/sessions"));
 
     let mut out: Vec<CanonSession> = Vec::new();
 
-    for s in claude::collect(&claude_root) {
+    for s in claude::collect(&claude_root, &cache::ScanCache::default()) {
         let mut subs: Vec<CanonSub> = s
             .subagents
             .into_iter()
@@ -109,7 +119,7 @@ fn main() {
         });
     }
 
-    for s in codex::collect(&codex_root) {
+    for s in codex::collect(&codex_root, &cache::ScanCache::default()) {
         let mut subs: Vec<CanonSub> = s
             .subagents
             .into_iter()

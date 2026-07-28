@@ -16,8 +16,10 @@ use serde_json::Value;
 use crate::model::{
     event_text, is_real_model, push_model, push_selection, Compaction, ModelAt, Selection, Usage,
 };
+use crate::cache::ScanCache;
 use crate::transcripts::{chronological, file_size, tail_events};
 
+#[derive(Clone)]
 pub struct Scan {
     pub timeline: Vec<ModelAt>,
     pub model: String,
@@ -260,7 +262,7 @@ fn spawn_records(transcript: &Path) -> HashMap<String, SpawnRecord> {
     out
 }
 
-pub fn collect(root: &Path) -> Vec<Session> {
+pub fn collect(root: &Path, cache: &ScanCache<Scan>) -> Vec<Session> {
     let mut sessions = Vec::new();
     if !root.is_dir() {
         return sessions;
@@ -284,7 +286,9 @@ pub fn collect(root: &Path) -> Vec<Session> {
 
         // Scan the project's transcripts across cores; pmap preserves input
         // order, so the result is identical to the sequential version.
-        let scans = crate::par::pmap(transcripts, |t| (t.clone(), scan(t, true)));
+        let scans = crate::par::pmap(transcripts, |t| {
+            (t.clone(), cache.get_or_scan(t, || scan(t, true)))
+        });
 
         for (transcript, info) in scans {
             let sid = transcript.file_stem().unwrap_or_default().to_string_lossy().to_string();
@@ -308,7 +312,9 @@ pub fn collect(root: &Path) -> Vec<Session> {
                     Err(_) => Vec::new(),
                 };
                 children.sort();
-                let child_scans = crate::par::pmap(children, |c| (c.clone(), scan(c, false)));
+                let child_scans = crate::par::pmap(children, |c| {
+                    (c.clone(), cache.get_or_scan(c, || scan(c, false)))
+                });
                 for (child, child_info) in child_scans {
                     let stem = child.file_stem().unwrap_or_default().to_string_lossy().to_string();
                     let agent_id = stem.trim_start_matches("agent-").to_string();
