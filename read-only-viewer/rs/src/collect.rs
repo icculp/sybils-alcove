@@ -61,7 +61,13 @@ pub struct Collector {
     /// scanning is cached that subprocess IS the refresh cost, so it gets its own
     /// longer TTL rather than running on every poll.
     procs: Mutex<Option<(Instant, std::collections::HashMap<String, process::Proc>, String)>>,
-    snapshot: Mutex<Option<(Instant, Value)>>,
+    /// (stored_at, value, how long the collect COST)
+    snapshot: Mutex<Option<(Instant, Value, Duration)>>,
+    /// Single-flight. Without it every waiting request starts its own collect:
+    /// with a 2 s TTL, a 3 s poll and a 5 s collect, each poll missed the cache
+    /// and launched another scan while the previous ones were still running.
+    /// They contended, each got slower, and one request measured 59.7 s.
+    refresh: Mutex<()>,
     cfg: Config,
 }
 
@@ -72,6 +78,7 @@ impl Collector {
             codex_cache: ScanCache::default(),
             procs: Mutex::new(None),
             snapshot: Mutex::new(None),
+            refresh: Mutex::new(()),
             cfg,
         }
     }
@@ -92,18 +99,37 @@ impl Collector {
         (map, status)
     }
 
-    pub fn cached(&self) -> Value {
-        let ttl = Duration::from_secs_f64(self.cfg.cache_ttl_s);
-        if let Ok(guard) = self.snapshot.lock() {
-            if let Some((at, value)) = guard.as_ref() {
-                if at.elapsed() < ttl {
-                    return value.clone();
-                }
-            }
+    /// Serve the cache for at least as long as the last collect TOOK.
+    ///
+    /// A fixed TTL shorter than the collect means the scan never stops running:
+    /// the result is stale before it is stored. Scaling the window to the
+    /// observed cost keeps the duty cycle bounded however large the corpus gets.
+    fn fresh(&self) -> Option<Value> {
+        let floor = Duration::from_secs_f64(self.cfg.cache_ttl_s);
+        let guard = self.snapshot.lock().ok()?;
+        let (at, value, cost) = guard.as_ref()?;
+        if at.elapsed() < floor.max(*cost) {
+            Some(value.clone())
+        } else {
+            None
         }
+    }
+
+    pub fn cached(&self) -> Value {
+        if let Some(value) = self.fresh() {
+            return value;
+        }
+        // One collect at a time. Everyone else waits here and re-checks, so a
+        // queue of waiting requests costs one scan rather than one scan each.
+        let _flight = self.refresh.lock();
+        if let Some(value) = self.fresh() {
+            return value;
+        }
+        let started = Instant::now();
         let value = self.collect();
+        let cost = started.elapsed();
         if let Ok(mut guard) = self.snapshot.lock() {
-            *guard = Some((Instant::now(), value.clone()));
+            *guard = Some((Instant::now(), value.clone(), cost));
         }
         value
     }
