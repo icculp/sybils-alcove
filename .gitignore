@@ -8,3 +8,6 @@ __pycache__/
 
 # Local design notes — in-repo for us, deliberately not published yet.
 DESIGN.md
+
+# Rust build output.
+target/
