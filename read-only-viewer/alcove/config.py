@@ -15,6 +15,16 @@ CODEX_ROOT = Path(
     os.environ.get("ALCOVE_CODEX_ROOT", Path.home() / ".codex" / "sessions")
 ).expanduser()
 
+# Codex keeps its own sqlite beside the rollouts, holding facts the transcripts
+# do not carry (agent nicknames, roles, the authoritative spawn graph). Optional
+# enrichment only — everything still works when it is absent or unreadable.
+# Empty means "discover it"; the filename carries a schema generation
+# (state_5 -> state_6 -> …), so the highest one present wins.
+CODEX_HOME = Path(
+    os.environ.get("ALCOVE_CODEX_HOME", Path.home() / ".codex")
+).expanduser()
+CODEX_STATE_DB = os.environ.get("ALCOVE_CODEX_STATE_DB", "")
+
 PORT = int(os.environ.get("ALCOVE_PORT", "8899"))
 # Localhost by default. Set ALCOVE_BIND=0.0.0.0 deliberately, knowing this page
 # shows task prompts and there is no auth in front of it.
