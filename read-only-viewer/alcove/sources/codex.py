@@ -12,6 +12,7 @@ from pathlib import Path
 from typing import Any
 
 from .. import config
+from . import codex_state
 from ..model import is_real_model, live_first, new_usage, push_model
 from ..transcripts import (chronological, file_size, head_events, mtime_age,
                            tail_events)
@@ -181,6 +182,25 @@ def collect_codex() -> list[dict[str, Any]]:
                 info["age_s"], info["live"], info["path"])
     scanned = list(merged.values())
 
+    # Codex's own sqlite, if readable. Transcript facts always win: the rollout
+    # is what actually happened, and this is a convenience index over it. It
+    # fills gaps — an agent's nickname and role, a spawn edge whose parent the
+    # head did not carry, and the open/closed status that transcripts never
+    # record. Absent or reshaped, every value below stays as it was.
+    state = codex_state.read()
+    threads, edges = state["threads"], state["edges"]
+    for info in scanned:
+        meta = threads.get(info["session_id"]) or {}
+        edge = edges.get(info["session_id"]) or {}
+        info["role"] = info["role"] or str(meta.get("agent_role") or "")
+        info["nickname"] = info["nickname"] or str(meta.get("agent_nickname") or "")
+        info["parent"] = info["parent"] or str(edge.get("parent") or "")
+        info["spawn_status"] = str(edge.get("status") or "")
+        info["branch"] = str(meta.get("git_branch") or "")
+        info["effort"] = info["effort"] or str(meta.get("reasoning_effort") or "")
+        info["model"] = info["model"] or str(meta.get("model") or "")
+        info["archived"] = bool(meta.get("archived"))
+
     children: dict[str, list[dict[str, Any]]] = {}
     for info in scanned:
         if info["parent"]:
@@ -195,7 +215,16 @@ def collect_codex() -> list[dict[str, Any]]:
             subs.append({
                 "id": child["session_id"], "label": child["session_id"][:12],
                 "model": child["model"], "record_model": "",
-                "role": child["role"] or child["nickname"], "status": "",
+                # Nickname is the human handle ("Cicero"); role is the job
+                # ("worker"). Keep both — the nickname is how the operator
+                # refers to an agent, the role is what it was for.
+                # No nickname fallback: it has its own column now, and echoing
+                # it into the role read as an agent whose job was "Kepler".
+                "role": child["role"],
+                "nickname": child["nickname"],
+                # Codex records no completion in the transcript; the spawn edge
+                # is the only place open/closed is written down.
+                "status": child.get("spawn_status", ""),
                 "timeline": child["timeline"], "usage": child["usage"],
                 "turns": child["turns"],
                 "reported_tokens": child["usage"]["output"] or None,
@@ -212,7 +241,8 @@ def collect_codex() -> list[dict[str, Any]]:
             # same window share an 8-char prefix and read as one duplicated row.
             "label": info["session_id"][:13],
             "project": Path(info["cwd"]).name if info["cwd"] else "unknown",
-            "cwd": info["cwd"], "branch": "", "effort": info["effort"],
+            "cwd": info["cwd"], "branch": info.get("branch", ""),
+            "effort": info["effort"], "nickname": info["nickname"],
             "model": info["model"], "timeline": info["timeline"],
             # Codex has no slash-command record; a model change emits its own
             # `turn_context`, so its served timeline already captures switches.

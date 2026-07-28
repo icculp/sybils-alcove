@@ -102,7 +102,12 @@ function compactHTML(s){
 function STATE(s){
   if(s.no_transcript) return '<span class="pill warn">no transcript</span>';
   if(s.live) return '<span class="run">running</span>';
-  if(s.status === 'completed') return '<span class="muted">done</span>';
+  // 'completed' is Claude's spawn record; 'closed'/'open' come from Codex's
+  // spawn edge, the only place Codex writes down that a subagent finished.
+  if(s.status === 'completed' || s.status === 'closed')
+    return '<span class="muted">done</span>';
+  if(s.status === 'open') return '<span class="muted" title="Codex still has '
+    + 'this spawn open, but the transcript has been idle">open · idle</span>';
   return '<span class="muted" title="launched in the background with no '
     + 'completion record; transcript has been idle">idle</span>';
 }
@@ -125,7 +130,8 @@ function subTable(subs, sid){
     const mism = s.record_model && s.model && s.record_model !== s.model;
     h += '<tr>'
       + '<td><span class="dot '+(s.live?'live':'idle')+'" '
-      +   'style="display:inline-block;margin-right:6px"></span><code>'+esc(s.label)+'</code></td>'
+      +   'style="display:inline-block;margin-right:6px"></span><code>'+esc(s.label)+'</code>'
+      +   (s.nickname?' <span class="nm">'+esc(s.nickname)+'</span>':'')+'</td>'
       + '<td class="muted">'+esc(s.role||'—')+'</td>'
       + '<td><span class="model sm">'+esc(s.model||'unknown')+'</span>'
       +   (mism?' <span class="pill warn">rec '+esc(s.record_model)+'</span>':'')
