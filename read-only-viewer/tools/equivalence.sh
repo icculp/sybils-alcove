@@ -46,6 +46,14 @@ if diff -q "$tmp/py.json" "$tmp/rs.json" > /dev/null; then
   b="$(./rs/target/release/alcove --snapshot)"
   [ "$a" = "$b" ] || { echo "FAIL — snapshot not deterministic"; exit 1; }
   echo "PASS — snapshot deterministic across runs"
+
+  # Third property: the two stores must agree. The snapshot gate cannot see
+  # this — snapshots carry no per-turn rows, so both sides can agree on every
+  # aggregate and still write different rows.
+  ALCOVE_DB="$tmp/py.db" ALCOVE_CODEX_HOME=/nonexistent \
+    python3 alcove.py --ingest-only > /dev/null
+  ALCOVE_DB="$tmp/rs.db" ./rs/target/release/alcove --ingest-only > /dev/null
+  python3 tools/store_equivalence.py "$tmp/py.db" "$tmp/rs.db" || exit 1
   exit 0
 fi
 

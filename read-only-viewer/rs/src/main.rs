@@ -19,6 +19,7 @@ mod config;
 mod model;
 mod par;
 mod process;
+mod store;
 mod transcripts;
 mod web;
 
@@ -72,6 +73,9 @@ fn env_path(key: &str, default: PathBuf) -> PathBuf {
 fn main() {
     // `--snapshot` emits the canonical form the equivalence gate diffs against;
     // with no arguments the binary serves.
+    if std::env::args().any(|a| a == "--ingest-only") {
+        std::process::exit(ingest_once());
+    }
     if !std::env::args().any(|a| a == "--snapshot") {
         std::process::exit(web::serve(config::Config::from_env()));
     }
@@ -171,4 +175,39 @@ fn main() {
         sessions: Vec<CanonSession>,
     }
     println!("{}", serde_json::to_string_pretty(&Doc { sessions: out }).unwrap());
+}
+
+/// One ingest pass, for cron. Idempotent: re-running on overlapping data is a
+/// no-op, which is the whole point of keying every fact on a natural id.
+fn ingest_once() -> i32 {
+    let cfg = config::Config::from_env();
+    let snapshot = collect::Collector::new(cfg).collect();
+    let mut conn = match store::connect(true) {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("store: {e}");
+            return 1;
+        }
+    };
+    println!("store: {}", store::db_path().display());
+    match store::ingest(&mut conn, &snapshot) {
+        Ok(c) => println!(
+            "  changed:  turn_new={}, selection_new={}, compaction_new={}, \
+observation_new={}, session_seen={}, subagent_seen={}",
+            c.turn_new, c.selection_new, c.compaction_new, c.observation_new,
+            c.session_seen, c.subagent_seen
+        ),
+        Err(e) => {
+            eprintln!("ingest failed: {e}");
+            return 1;
+        }
+    }
+    if let Ok(t) = store::totals(&conn) {
+        println!(
+            "  lifetime: {} turns, {} output tokens, {} sessions",
+            t["turns"], t["output"], t["sessions"]
+        );
+        println!("  span:     {} .. {}", t["first_ts"], t["last_ts"]);
+    }
+    0
 }

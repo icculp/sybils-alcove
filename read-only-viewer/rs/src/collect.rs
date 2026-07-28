@@ -26,6 +26,28 @@ fn rank(state: &str) -> u8 {
     }
 }
 
+/// ISO-8601 UTC, matching what the Python wrote.
+///
+/// The store compares these against sqlite `date('now', ...)`, so a unix integer
+/// here would silently make every date filter match nothing.
+fn iso_now() -> String {
+    let secs = SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
+    let (days, rem) = ((secs / 86400) as i64, secs % 86400);
+    // Civil date from days since epoch (Howard Hinnant's algorithm).
+    let z = days + 719468;
+    let era = z.div_euclid(146097);
+    let doe = z.rem_euclid(146097);
+    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
+    let y = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    let y = if m <= 2 { y + 1 } else { y };
+    format!("{:04}-{:02}-{:02}T{:02}:{:02}:{:02}Z",
+            y, m, d, rem / 3600, (rem % 3600) / 60, rem % 60)
+}
+
 fn age_s(path: &PathBuf) -> Option<f64> {
     let modified = path.metadata().ok()?.modified().ok()?;
     let now = SystemTime::now();
@@ -137,6 +159,7 @@ impl Collector {
                         "live": sub_age.map(|x| x < self.cfg.live_window_s).unwrap_or(false),
                         "no_transcript": a.no_transcript,
                         "timeline": Vec::<Value>::new(),
+                        "turn_rows": a.turn_rows,
                     })
                 })
                 .collect();
@@ -154,6 +177,7 @@ impl Collector {
                 "agent_name": proc.map(|p| p.name.clone()).unwrap_or_default(),
                 "kind": proc.map(|p| p.kind.clone()).unwrap_or_default(),
                 "switches": (s.timeline.len().max(1) - 1),
+                "turn_rows": s.turn_rows,
                 "state": state, "state_inferred": false,
                 // A process can own a session for a day without the model
                 // writing a word: "running" means the window is open, not that
@@ -183,8 +207,9 @@ impl Collector {
                             Value::Null
                         },
                         "tool_uses": Value::Null, "task": a.task,
-                        "size": 0, "age_s": Value::Null, "live": false,
+                        "size": a.size, "age_s": a.age_s, "live": a.live,
                         "no_transcript": false, "timeline": Vec::<Value>::new(),
+                        "turn_rows": a.turn_rows,
                     })
                 })
                 .collect();
@@ -200,6 +225,7 @@ impl Collector {
                 "subagents": subs, "path": s.path.to_string_lossy(),
                 "pids": Vec::<i64>::new(), "agent_name": "", "kind": "",
                 "switches": (s.timeline.len().max(1) - 1),
+                "turn_rows": s.turn_rows,
                 "state": state, "state_inferred": true,
                 "quiet": false,
             }));
@@ -219,7 +245,7 @@ impl Collector {
 
         let (ch, cm) = self.claude_cache.stats();
         let (xh, xm) = self.codex_cache.stats();
-        let now = SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
+        let now = iso_now();
         json!({
             "generated_at": now,
             "live_window_s": self.cfg.live_window_s,

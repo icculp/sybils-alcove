@@ -145,8 +145,14 @@ def collect_codex() -> list[dict[str, Any]]:
     # NOTE: no thread in the corpus this was written against actually spanned
     # multiple files, so this merge path is effectively untested.
     merged: dict[str, dict[str, Any]] = {}
+    # Sort on (mtime_ns, path), not mtime alone. A resumed Codex thread replays
+    # history into a new rollout, so the SAME message id can appear in several
+    # files; with INSERT OR IGNORE the store keeps whichever is seen first, which
+    # made the winner depend on filesystem enumeration order. Nanoseconds avoid
+    # float rounding, and the path breaks ties.
     for path in sorted(root.rglob("*.jsonl"),
-                       key=lambda p: p.stat().st_mtime if p.exists() else 0):
+                       key=lambda p: (p.stat().st_mtime_ns if p.exists() else 0,
+                                      str(p))):
         info = scan_codex(path)
         sid = info["session_id"]
         if not sid:

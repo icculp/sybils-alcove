@@ -14,7 +14,7 @@ switched over.
 | incremental scan | ⬜ | ✅ | — (Rust only, by decision) |
 | HTTP server + `/api/sessions` | ✅ | ✅ | Python |
 | pid liveness | ✅ | ✅ | Python |
-| store (sqlite) | ✅ | ⬜ | Python |
+| store (sqlite) + `/api/activity` | ✅ | ✅ | Python |
 | spillout | ✅ | ⬜ | Python |
 | activity | ✅ | ⬜ | Python |
 | Codex `state_<N>.sqlite` | ✅ | ⬜ | Python |
@@ -41,9 +41,8 @@ a message saying so, rather than a 404 that looks like a typo.
    gets 146 MB down to ~1 MB per poll and rests on one provable claim: a file
    whose size and mtime are unchanged produces the same scan. True byte-offset
    incrementality stays available if that is ever not enough.
-3. **store** — rusqlite, bundled. Needed for activity, and where the schema
-   decision gets made.
-4. spillout, activity, Codex sqlite — mechanical once 1–3 land.
+3. ~~**store**~~ — done. rusqlite bundled; `--ingest-only` and `/api/activity`.
+4. spillout, Codex sqlite — the last two before Python can be deleted.
 5. delete the Python, move `rs/*` up a level, delete the gate and this file.
 
 ## The equivalence gate
@@ -55,9 +54,16 @@ It exists to make replacement safe, and it is temporary. Two properties:
 
 - **cross-implementation** — Python and Rust produce byte-identical canonical
   snapshots. Passing over 31 sessions.
-- **incremental vs cold** (once step 2 lands) — an incremental scan must equal a
-  cold full rescan of the same corpus. This is the property that keeps a stale
-  offset from silently hiding events.
+- **snapshot determinism** — repeated runs agree, so the parallel scan cannot
+  reorder anything.
+- **store equivalence** — both implementations ingest identical rows into
+  `turn`, `selection`, `compaction`, `session`, `subagent`. This one earns its
+  keep: snapshots carry no per-turn rows, so both sides agreed on every
+  aggregate while writing DIFFERENT rows to the store, and only this check saw
+  it.
+- **incremental vs cold** — verified when incremental landed: appending one
+  event produced exactly one cache miss, and the warm snapshot equalled a cold
+  full rescan.
 
 **Always run it against a frozen fixture.** Against the live transcript roots it
 fails with `last_ts` minutes apart and token totals grown — agents appending to
@@ -76,6 +82,27 @@ implementation.
   reproduces the "which one ships?" ambiguity this document exists to remove.
 - **Codex's private sqlite is disabled on the Python side during the gate**, so
   the two are compared like for like until it is ported.
+
+## Known defect: Codex turn ids collide across threads
+
+`turn.id` uses the natural key (`payload.id`), and the store's whole premise is
+that this makes ingestion idempotent. For Codex that premise is 99.7% true and
+not 100%: a spawned agent inherits the parent's replayed history, so the same
+assistant message id can appear in the parent AND in every child thread. All of
+them are stored under the parent's `session_id`, so they collide, and
+`INSERT OR IGNORE` keeps whichever is written first.
+
+Measured on the fixture: 1,967 Codex turn rows generated, 1,961 distinct ids,
+**6 rows silently dropped (0.3%)**, worst id appearing 7 times across 7 threads.
+
+That also made the two implementations disagree until Rust sorted subagents the
+way Python does — the surviving row depended on iteration order, which is not a
+property anything should depend on.
+
+The fix is a composite key that records the OWNING thread rather than only the
+parent session, and it is a schema change. Deliberately not made while two
+implementations must agree row for row; it belongs immediately after the Python
+is deleted.
 
 ## Known complications
 
