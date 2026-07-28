@@ -10,12 +10,13 @@ use std::path::{Path, PathBuf};
 
 use serde_json::Value;
 
-use crate::model::{is_real_model, push_model, Compaction, ModelAt, Usage};
+use crate::model::{is_real_model, push_model, Compaction, ModelAt, TurnRow, Usage};
 use crate::cache::ScanCache;
 use crate::transcripts::{chronological, file_size, head_events, tail_events};
 
 #[derive(Clone)]
 pub struct Scan {
+    pub turn_rows: Vec<TurnRow>,
     pub session_id: String,
     pub parent: String,
     pub role: String,
@@ -32,9 +33,15 @@ pub struct Scan {
     pub turns_since_compact: Option<i64>,
     pub path: PathBuf,
     pub size: u64,
+    pub age_s: Option<f64>,
+    pub live: bool,
 }
 
 pub struct SubAgent {
+    pub turn_rows: Vec<TurnRow>,
+    pub age_s: Option<f64>,
+    pub live: bool,
+    pub size: u64,
     pub id: String,
     pub label: String,
     pub model: String,
@@ -45,6 +52,7 @@ pub struct SubAgent {
 }
 
 pub struct Session {
+    pub turn_rows: Vec<TurnRow>,
     pub session_id: String,
     pub label: String,
     pub project: String,
@@ -62,6 +70,7 @@ pub struct Session {
 
 pub fn scan(path: &Path) -> Scan {
     let mut timeline: Vec<ModelAt> = Vec::new();
+    let mut turn_rows: Vec<TurnRow> = Vec::new();
     let mut usage = Usage::default();
     let (mut turns, mut ctx_turns) = (0i64, 0i64);
     let mut compactions: Vec<Compaction> = Vec::new();
@@ -165,6 +174,21 @@ pub fn scan(path: &Path) -> Scan {
             if !ts.is_empty() {
                 last_ts = ts.clone();
             }
+            let pid = payload.get("id").and_then(Value::as_str).unwrap_or("");
+            turn_rows.push(TurnRow {
+                id: if pid.is_empty() {
+                    format!("{}:{}", path.file_name().unwrap_or_default().to_string_lossy(), ts)
+                } else {
+                    pid.to_string()
+                },
+                ts: ts.clone(),
+                model: timeline.last().map(|m| m.model.clone()).unwrap_or_default(),
+                // Cumulative session snapshots, so no per-turn attribution.
+                input: None,
+                output: None,
+                cache_read: None,
+                cache_write: None,
+            });
         } else if kind == "event_msg" && ptype == "token_count" {
             let Some(info) = payload.get("info").filter(|i| i.is_object()) else {
                 continue;
@@ -193,6 +217,7 @@ pub fn scan(path: &Path) -> Scan {
         reasoning: (usage.reasoning - at.reasoning).max(0),
     });
     Scan {
+        turn_rows,
         session_id: sid,
         parent,
         role,
@@ -208,6 +233,8 @@ pub fn scan(path: &Path) -> Scan {
         usage_since_compact: since,
         turns_since_compact: if has_compactions { Some(ctx_turns) } else { None },
         size: file_size(path),
+        age_s: None,
+        live: false,
         path: path.to_path_buf(),
     }
 }
@@ -235,11 +262,41 @@ pub fn collect(root: &Path, cache: &ScanCache<Scan>) -> Vec<Session> {
     walk_jsonl(root, &mut paths);
     // A Codex thread can span several rollout files (resume, rollback); merge by
     // thread id with the NEWEST file winning, so sort by mtime as Python does.
-    paths.sort_by_key(|p| p.metadata().and_then(|m| m.modified()).ok());
+    // Sort on (mtime_ns, path), not mtime alone — see the note in the Python
+    // source: a resumed thread replays the same message ids into a new rollout,
+    // and INSERT OR IGNORE keeps whichever is seen first.
+    paths.sort_by(|a, b| {
+        let key = |p: &PathBuf| {
+            let ns = p
+                .metadata()
+                .and_then(|m| m.modified())
+                .ok()
+                .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                .map(|d| d.as_nanos())
+                .unwrap_or(0);
+            (ns, p.clone())
+        };
+        key(a).cmp(&key(b))
+    });
 
     // Rollouts are independent files; scan them across cores, then merge
     // sequentially so the newest-file-wins ordering is unchanged.
-    let scans = crate::par::pmap(paths, |p| cache.get_or_scan(p, || scan(p)));
+    let live_window: f64 =
+        std::env::var("ALCOVE_LIVE_WINDOW_S").ok().and_then(|v| v.parse().ok()).unwrap_or(300.0);
+    let mut scans = crate::par::pmap(paths, |p| cache.get_or_scan(p, || scan(p)));
+    // Age is wall-clock, so it is computed per collect rather than cached with
+    // the scan — a cached `live` flag would freeze at whatever it was when the
+    // file was last parsed.
+    for info in scans.iter_mut() {
+        info.age_s = info
+            .path
+            .metadata()
+            .ok()
+            .and_then(|m| m.modified().ok())
+            .and_then(|t| std::time::SystemTime::now().duration_since(t).ok())
+            .map(|d| d.as_secs_f64());
+        info.live = info.age_s.map(|a| a < live_window).unwrap_or(false);
+    }
 
     let mut merged: Vec<Scan> = Vec::new();
     let mut index: HashMap<String, usize> = HashMap::new();
@@ -259,6 +316,7 @@ pub fn collect(root: &Path, cache: &ScanCache<Scan>) -> Vec<Session> {
                 let prior = &mut merged[at];
                 prior.size += info.size;
                 prior.turns += info.turns;
+                prior.turn_rows.extend(info.turn_rows.clone());
                 for m in &info.timeline {
                     if prior.timeline.last().map(|t| &t.model) != Some(&m.model) {
                         prior.timeline.push(m.clone());
@@ -316,6 +374,10 @@ pub fn collect(root: &Path, cache: &ScanCache<Scan>) -> Vec<Session> {
         for &ci in children.get(&info.session_id).unwrap_or(&Vec::new()) {
             let child = &merged[ci];
             subs.push(SubAgent {
+                turn_rows: child.turn_rows.clone(),
+                age_s: child.age_s,
+                live: child.live,
+                size: child.size,
                 id: child.session_id.clone(),
                 label: child.session_id.chars().take(12).collect(),
                 model: child.model.clone(),
@@ -325,8 +387,17 @@ pub fn collect(root: &Path, cache: &ScanCache<Scan>) -> Vec<Session> {
                 task: child.nickname.clone(),
             });
         }
+        // Running subagents first, then freshest — the same order the session
+        // list uses, so the eye moves the same way at both levels. Python sorts
+        // here too; omitting it made the store's INSERT OR IGNORE pick a
+        // different winner for ids that appear in more than one thread.
+        subs.sort_by(|a, b| {
+            let key = |s: &SubAgent| (!s.live, s.age_s.unwrap_or(1e18));
+            key(a).partial_cmp(&key(b)).unwrap_or(std::cmp::Ordering::Equal)
+        });
         let _ = i;
         sessions.push(Session {
+            turn_rows: info.turn_rows.clone(),
             // Codex thread ids are time-ordered, so two sessions started in the
             // same window share an 8-char prefix and read as one duplicated row.
             label: info.session_id.chars().take(13).collect(),

@@ -117,3 +117,21 @@ pub fn event_text(event: &Value) -> String {
         Err(_) => String::new(),
     }
 }
+
+/// One assistant turn, for the store.
+///
+/// `id` is a NATURAL key — Claude's `message.id`, Codex's `payload.id`, falling
+/// back to `file:timestamp`. That is what makes ingestion idempotent, and
+/// therefore what makes re-scanning overlapping windows free.
+#[derive(Debug, Clone, Serialize)]
+pub struct TurnRow {
+    pub id: String,
+    pub ts: String,
+    pub model: String,
+    /// Null for Codex: its token totals are cumulative session snapshots, so
+    /// there is no per-turn attribution and inventing one would be a guess.
+    pub input: Option<i64>,
+    pub output: Option<i64>,
+    pub cache_read: Option<i64>,
+    pub cache_write: Option<i64>,
+}

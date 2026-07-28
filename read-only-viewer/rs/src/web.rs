@@ -12,12 +12,16 @@ use std::sync::Arc;
 use tiny_http::{Header, Method, Request, Response, Server};
 
 use crate::collect::Collector;
+use crate::store;
 use crate::config::{Config, COOKIE};
 
 const INDEX: &str = include_str!("../../alcove/static/index.html");
 const LOGIN: &str = include_str!("../../alcove/static/login.html");
 const APP_JS: &str = include_str!("../../alcove/static/app.js");
 const APP_CSS: &str = include_str!("../../alcove/static/app.css");
+const ACTIVITY: &str = include_str!("../../alcove/static/activity.html");
+const ACTIVITY_JS: &str = include_str!("../../alcove/static/activity.js");
+const ACTIVITY_CSS: &str = include_str!("../../alcove/static/activity.css");
 
 const HTML: &str = "text/html; charset=utf-8";
 const JSON: &str = "application/json";
@@ -95,6 +99,8 @@ fn asset(name: &str) -> Option<(&'static str, &'static str)> {
     match name {
         "app.js" => Some((APP_JS, "text/javascript; charset=utf-8")),
         "app.css" => Some((APP_CSS, "text/css; charset=utf-8")),
+        "activity.js" => Some((ACTIVITY_JS, "text/javascript; charset=utf-8")),
+        "activity.css" => Some((ACTIVITY_CSS, "text/css; charset=utf-8")),
         _ => None,
     }
 }
@@ -209,9 +215,14 @@ fn handle(request: Request, collector: &Collector, cfg: &Config) {
             let body = serde_json::to_vec(&collector.cached()).unwrap_or_default();
             send(request, body, JSON, 200, None)
         }
+        "/api/activity" => {
+            let body = serde_json::to_vec(&activity(&url)).unwrap_or_default();
+            send(request, body, JSON, 200, None)
+        }
+        "/activity" => send(request, ACTIVITY.as_bytes().to_vec(), HTML, 200, None),
         // Not ported yet. A 501 that names the reason beats a 404 that looks
         // like a typo — the Python still serves these.
-        "/api/activity" | "/api/spill" => send(
+        "/api/spill" => send(
             request,
             br#"{"error":"not ported to the rust core yet; run the python server for this route"}"#
                 .to_vec(),
@@ -227,5 +238,44 @@ fn handle(request: Request, collector: &Collector, cfg: &Config) {
             }
         }
         _ => send(request, b"not found".to_vec(), "text/plain", 404, None),
+    }
+}
+
+/// Daily history from the store — not bounded by the tail window the live view
+/// reads, which is the whole reason the store exists.
+///
+/// A missing or unreadable store is an EXPECTED state on a fresh install, not a
+/// fault: say which it is and how to fix it, rather than returning an error the
+/// page cannot act on.
+fn activity(url: &str) -> serde_json::Value {
+    let days: i64 = url
+        .split('?')
+        .nth(1)
+        .and_then(|q| {
+            q.split('&').find_map(|kv| kv.strip_prefix("days=").map(|v| v.to_string()))
+        })
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(30)
+        .clamp(1, 365);
+    let db = store::db_path().display().to_string();
+    let conn = match store::connect(false) {
+        Ok(c) => c,
+        Err(e) => {
+            return serde_json::json!({
+                "days": days, "rows": [], "totals": {}, "db": db,
+                "unavailable": e.to_string(),
+                "hint": "populate it with:  alcove --ingest-only",
+            })
+        }
+    };
+    match (store::daily_activity(&conn, days), store::totals(&conn)) {
+        (Ok(rows), Ok(totals)) => {
+            serde_json::json!({"days": days, "rows": rows, "totals": totals, "db": db})
+        }
+        (Err(e), _) | (_, Err(e)) => serde_json::json!({
+            "days": days, "rows": [], "totals": {}, "db": db,
+            "unavailable": e.to_string(),
+            "hint": "populate it with:  alcove --ingest-only",
+        }),
     }
 }

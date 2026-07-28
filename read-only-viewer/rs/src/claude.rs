@@ -14,13 +14,15 @@ use regex::Regex;
 use serde_json::Value;
 
 use crate::model::{
-    event_text, is_real_model, push_model, push_selection, Compaction, ModelAt, Selection, Usage,
+    event_text, is_real_model, push_model, push_selection, Compaction, ModelAt, Selection,
+    TurnRow, Usage,
 };
 use crate::cache::ScanCache;
 use crate::transcripts::{chronological, file_size, tail_events};
 
 #[derive(Clone)]
 pub struct Scan {
+    pub turn_rows: Vec<TurnRow>,
     pub timeline: Vec<ModelAt>,
     pub model: String,
     pub selections: Vec<Selection>,
@@ -37,6 +39,7 @@ pub struct Scan {
 }
 
 pub struct SubAgent {
+    pub turn_rows: Vec<TurnRow>,
     pub id: String,
     pub label: String,
     pub model: String,
@@ -51,6 +54,7 @@ pub struct SubAgent {
 }
 
 pub struct Session {
+    pub turn_rows: Vec<TurnRow>,
     pub session_id: String,
     pub label: String,
     pub project: String,
@@ -99,6 +103,7 @@ impl Res {
 pub fn scan(path: &Path, main_thread_only: bool) -> Scan {
     let res = Res::new();
     let mut timeline: Vec<ModelAt> = Vec::new();
+    let mut turn_rows: Vec<TurnRow> = Vec::new();
     let mut selections: Vec<Selection> = Vec::new();
     let mut pending_args = String::new();
     let mut usage = Usage::default();
@@ -201,6 +206,23 @@ pub fn scan(path: &Path, main_thread_only: bool) -> Scan {
         if first {
             turns += 1;
             ctx_turns += 1;
+            // Keyed by message.id so a re-scan of overlapping windows is a
+            // no-op; with no id, file+timestamp is still stable across scans.
+            let u = message.get("usage");
+            let g = |k: &str| u.and_then(|x| x.get(k)).and_then(Value::as_i64).unwrap_or(0);
+            turn_rows.push(TurnRow {
+                id: if msg_id.is_empty() {
+                    format!("{}:{}", path.file_name().unwrap_or_default().to_string_lossy(), ts)
+                } else {
+                    msg_id.clone()
+                },
+                ts: ts.clone(),
+                model: model.to_string(),
+                input: Some(g("input_tokens")),
+                output: Some(g("output_tokens")),
+                cache_read: Some(g("cache_read_input_tokens")),
+                cache_write: Some(g("cache_creation_input_tokens")),
+            });
         }
         push_model(&mut timeline, model, &ts);
     }
@@ -209,6 +231,7 @@ pub fn scan(path: &Path, main_thread_only: bool) -> Scan {
     let selected_model = selections.last().map(|s| s.model.clone()).unwrap_or_default();
     let has_compactions = !compactions.is_empty();
     Scan {
+        turn_rows,
         timeline,
         model,
         selections,
@@ -320,6 +343,7 @@ pub fn collect(root: &Path, cache: &ScanCache<Scan>) -> Vec<Session> {
                     let agent_id = stem.trim_start_matches("agent-").to_string();
                     let record = records.get(&agent_id);
                     subs.push(SubAgent {
+                        turn_rows: child_info.turn_rows.clone(),
                         label: agent_id.chars().take(12).collect(),
                         // Child transcript wins: written from the first event, so
                         // a running subagent reports its model before any record.
@@ -347,6 +371,7 @@ pub fn collect(root: &Path, cache: &ScanCache<Scan>) -> Vec<Session> {
             orphans.sort_by(|a, b| a.0.cmp(b.0));
             for (agent_id, record) in orphans {
                 subs.push(SubAgent {
+                    turn_rows: Vec::new(),
                     id: agent_id.clone(),
                     label: agent_id.chars().take(12).collect(),
                     model: record.resolved_model.clone(),
@@ -362,6 +387,7 @@ pub fn collect(root: &Path, cache: &ScanCache<Scan>) -> Vec<Session> {
             }
 
             sessions.push(Session {
+                turn_rows: info.turn_rows.clone(),
                 label: sid.chars().take(8).collect(),
                 session_id: sid,
                 project: project.file_name().unwrap_or_default().to_string_lossy().to_string(),
