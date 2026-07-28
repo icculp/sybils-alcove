@@ -7,6 +7,7 @@ and those come from different sources.
 
 from __future__ import annotations
 
+import threading
 import time
 from typing import Any
 
@@ -15,7 +16,12 @@ from .sources.claude import collect_claude
 from .sources.codex import collect_codex
 from .sources.process import claude_bin, codex_process_count, running_pids
 
-_cache: dict[str, Any] = {"at": 0.0, "data": None}
+_cache: dict[str, Any] = {"at": 0.0, "data": None, "cost": 0.0}
+# Single-flight: without this every waiting request starts its OWN collect.
+# With a 2s TTL, a 3s poll and a 5s collect, each poll missed the cache and
+# launched another scan while the previous ones were still running; they
+# contended, each got slower, and one request was measured at 59.7s.
+_refresh = threading.Lock()
 
 # State outranks file age: a running session whose transcript has been quiet for
 # a day still belongs above a finished one that wrote a minute ago.
@@ -66,12 +72,33 @@ def collect() -> dict[str, Any]:
     }
 
 
+def _fresh(now: float) -> bool:
+    """Serve the cache for at least as long as the last collect TOOK.
+
+    A fixed 2s TTL against a 5s collect means the scan never stops running: the
+    result is stale before it is stored. Scaling the window to the observed cost
+    keeps the duty cycle bounded no matter how large the corpus grows.
+    """
+    if _cache["data"] is None:
+        return False
+    ttl = max(config.CACHE_TTL_S, _cache["cost"])
+    return now - _cache["at"] <= ttl
+
+
 def cached() -> dict[str, Any]:
-    now = time.time()
-    if _cache["data"] is None or now - _cache["at"] > config.CACHE_TTL_S:
-        _cache["data"] = collect()
-        _cache["at"] = now
-    return _cache["data"]
+    if _fresh(time.time()):
+        return _cache["data"]
+    # One collect at a time. Everyone else waits here and then re-checks, so a
+    # queue of waiting requests costs one scan rather than one scan each.
+    with _refresh:
+        if _fresh(time.time()):
+            return _cache["data"]
+        started = time.time()
+        data = collect()
+        _cache["data"] = data
+        _cache["cost"] = time.time() - started
+        _cache["at"] = time.time()
+        return data
 
 
 def public(snapshot: dict[str, Any]) -> dict[str, Any]:
