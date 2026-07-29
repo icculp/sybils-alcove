@@ -68,6 +68,13 @@ pub struct Collector {
     /// and launched another scan while the previous ones were still running.
     /// They contended, each got slower, and one request measured 59.7 s.
     refresh: Mutex<()>,
+    /// (session_id, agent_id) -> (transcript path, harness, display meta).
+    ///
+    /// The client sends IDS, never paths. Resolving through a map the collector
+    /// itself built means an unknown id is simply absent rather than a
+    /// filesystem read, so no request can reach a file the collector did not
+    /// already choose to open.
+    paths: Mutex<std::collections::HashMap<(String, String), (PathBuf, String, Value)>>,
     cfg: Config,
 }
 
@@ -79,6 +86,7 @@ impl Collector {
             procs: Mutex::new(None),
             snapshot: Mutex::new(None),
             refresh: Mutex::new(()),
+            paths: Mutex::new(std::collections::HashMap::new()),
             cfg,
         }
     }
@@ -134,6 +142,15 @@ impl Collector {
         value
     }
 
+    /// Resolve a session/agent id pair to a transcript, for spillout.
+    pub fn resolve(&self, session: &str, agent: &str) -> Option<(PathBuf, String, Value)> {
+        // Ensure the index exists even if nothing has hit /api/sessions yet.
+        if self.paths.lock().map(|g| g.is_empty()).unwrap_or(true) {
+            let _ = self.cached();
+        }
+        self.paths.lock().ok()?.get(&(session.to_string(), agent.to_string())).cloned()
+    }
+
     pub fn collect(&self) -> Value {
         let (pids, pid_source) = self.processes();
         let claude_sessions = claude::collect(&self.cfg.claude_root, &self.claude_cache);
@@ -141,10 +158,19 @@ impl Collector {
 
         let mut live_paths: Vec<PathBuf> = Vec::new();
         let _ = &live_paths;
+        let mut index: std::collections::HashMap<(String, String), (PathBuf, String, Value)> =
+            std::collections::HashMap::new();
         let mut out: Vec<Value> = Vec::new();
 
         for s in &claude_sessions {
             live_paths.push(s.path.clone());
+            index.insert(
+                (s.session_id.clone(), String::new()),
+                (s.path.clone(), "claude".into(), json!({
+                    "session_id": s.session_id, "agent_id": "", "label": s.label,
+                    "model": s.model, "cwd": s.cwd, "project": s.project,
+                })),
+            );
             let age = age_s(&s.path);
             let live = age.map(|a| a < self.cfg.live_window_s).unwrap_or(false);
             let proc = pids.get(&s.session_id);
@@ -173,6 +199,16 @@ impl Collector {
                         .join(format!("agent-{}.jsonl", a.id));
                     let sub_age = if a.no_transcript { None } else { age_s(&sub_path) };
                     if !a.no_transcript {
+                        index.insert(
+                            (s.session_id.clone(), a.id.clone()),
+                            (sub_path.clone(), "claude".into(), json!({
+                                "session_id": s.session_id, "agent_id": a.id,
+                                "label": a.label, "model": a.model, "cwd": s.cwd,
+                                "project": s.project, "role": a.role, "task": a.task,
+                                "state": if sub_age.map(|x| x < self.cfg.live_window_s)
+                                    .unwrap_or(false) { "running" } else { "" },
+                            })),
+                        );
                         live_paths.push(sub_path);
                     }
                     json!({
@@ -214,6 +250,13 @@ impl Collector {
 
         for s in &codex_sessions {
             live_paths.push(s.path.clone());
+            index.insert(
+                (s.session_id.clone(), String::new()),
+                (s.path.clone(), "codex".into(), json!({
+                    "session_id": s.session_id, "agent_id": "", "label": s.label,
+                    "model": s.model, "cwd": s.cwd, "project": s.project,
+                })),
+            );
             let age = age_s(&s.path);
             let live = age.map(|a| a < self.cfg.live_window_s).unwrap_or(false);
             // Codex has no per-session pid, so transcript freshness is the only
@@ -225,7 +268,8 @@ impl Collector {
                 .map(|a| {
                     json!({
                         "id": a.id, "label": a.label, "model": a.model,
-                        "record_model": "", "role": a.role, "status": "",
+                        "record_model": "", "role": a.role, "status": a.status,
+                        "nickname": a.nickname,
                         "turns": a.turns, "usage": a.usage,
                         "reported_tokens": if a.usage.output > 0 {
                             json!(a.usage.output)
@@ -241,7 +285,8 @@ impl Collector {
                 .collect();
             out.push(json!({
                 "harness": "codex", "session_id": s.session_id, "label": s.label,
-                "project": s.project, "cwd": s.cwd, "branch": "",
+                "project": s.project, "cwd": s.cwd, "branch": s.branch,
+                "nickname": s.nickname,
                 "effort": s.effort, "model": s.model,
                 "selected_model": "", "selections": Vec::<Value>::new(),
                 "timeline": s.timeline, "usage": s.usage, "turns": s.turns,
@@ -266,6 +311,9 @@ impl Collector {
         });
 
         // Drop cache entries for transcripts that no longer exist.
+        if let Ok(mut guard) = self.paths.lock() {
+            *guard = index;
+        }
         self.claude_cache.evict_missing();
         self.codex_cache.evict_missing();
 

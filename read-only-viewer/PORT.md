@@ -15,14 +15,13 @@ switched over.
 | HTTP server + `/api/sessions` | ✅ | ✅ | Python |
 | pid liveness | ✅ | ✅ | Python |
 | store (sqlite) + `/api/activity` | ✅ | ✅ | Python |
-| spillout | ✅ | ⬜ | Python |
-| activity | ✅ | ⬜ | Python |
-| Codex `state_<N>.sqlite` | ✅ | ⬜ | Python |
+| spillout | ✅ | ✅ | Python |
+| activity | ✅ | ✅ | Python |
+| Codex `state_<N>.sqlite` | ✅ | ✅ | Python |
 | browser UI (JS/CSS) | — | — | stays as-is, not ported |
 
-The Rust binary serves the session list today. It is not the shipping server yet
-because `/spill` and `/activity` are still Python — those routes return 501 with
-a message saying so, rather than a 404 that looks like a typo.
+**Every route is now ported.** The Rust binary serves the whole viewer; the
+Python is still what the systemd unit runs, pending the cutover.
 
 ## Order of work
 
@@ -42,8 +41,10 @@ a message saying so, rather than a 404 that looks like a typo.
    whose size and mtime are unchanged produces the same scan. True byte-offset
    incrementality stays available if that is ever not enough.
 3. ~~**store**~~ — done. rusqlite bundled; `--ingest-only` and `/api/activity`.
-4. spillout, Codex sqlite — the last two before Python can be deleted.
-5. delete the Python, move `rs/*` up a level, delete the gate and this file.
+4. ~~spillout, Codex sqlite~~ — done.
+5. **freeze** the Python as a reference implementation, cut the unit over to the
+   Rust binary, then fix the `turn.id` collision (a deliberate divergence, so it
+   has to come after the freeze).
 
 ## The equivalence gate
 
@@ -80,8 +81,9 @@ implementation.
 - **The UI is not ported.** It is already the right language.
 - **`rs/` stays inside `read-only-viewer/`.** A parallel top-level tree
   reproduces the "which one ships?" ambiguity this document exists to remove.
-- **Codex's private sqlite is disabled on the Python side during the gate**, so
-  the two are compared like for like until it is ported.
+- **The Codex sqlite is now compared, not disabled.** `--freeze` copies
+  `state_*.sqlite` into the fixture and both implementations are pointed at it,
+  so neither reads the live file mid-gate.
 
 ## Known defect: Codex turn ids collide across threads
 

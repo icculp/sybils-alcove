@@ -22,6 +22,9 @@ const APP_CSS: &str = include_str!("../../alcove/static/app.css");
 const ACTIVITY: &str = include_str!("../../alcove/static/activity.html");
 const ACTIVITY_JS: &str = include_str!("../../alcove/static/activity.js");
 const ACTIVITY_CSS: &str = include_str!("../../alcove/static/activity.css");
+const SPILL: &str = include_str!("../../alcove/static/spill.html");
+const SPILL_JS: &str = include_str!("../../alcove/static/spill.js");
+const SPILL_CSS: &str = include_str!("../../alcove/static/spill.css");
 
 const HTML: &str = "text/html; charset=utf-8";
 const JSON: &str = "application/json";
@@ -101,6 +104,8 @@ fn asset(name: &str) -> Option<(&'static str, &'static str)> {
         "app.css" => Some((APP_CSS, "text/css; charset=utf-8")),
         "activity.js" => Some((ACTIVITY_JS, "text/javascript; charset=utf-8")),
         "activity.css" => Some((ACTIVITY_CSS, "text/css; charset=utf-8")),
+        "spill.js" => Some((SPILL_JS, "text/javascript; charset=utf-8")),
+        "spill.css" => Some((SPILL_CSS, "text/css; charset=utf-8")),
         _ => None,
     }
 }
@@ -220,16 +225,31 @@ fn handle(request: Request, collector: &Collector, cfg: &Config) {
             send(request, body, JSON, 200, None)
         }
         "/activity" => send(request, ACTIVITY.as_bytes().to_vec(), HTML, 200, None),
-        // Not ported yet. A 501 that names the reason beats a 404 that looks
-        // like a typo — the Python still serves these.
-        "/api/spill" => send(
-            request,
-            br#"{"error":"not ported to the rust core yet; run the python server for this route"}"#
-                .to_vec(),
-            JSON,
-            501,
-            None,
-        ),
+        "/api/spill" => {
+            let q = |k: &str| -> String {
+                url.split('?').nth(1).and_then(|qs| {
+                    qs.split('&').find_map(|kv| {
+                        kv.strip_prefix(&format!("{k}=")).map(|v| {
+                            percent_decode(v)
+                        })
+                    })
+                }).unwrap_or_default()
+            };
+            let num = |k: &str, d: i64, lo: i64, hi: i64| -> i64 {
+                q(k).parse().unwrap_or(d).clamp(lo, hi)
+            };
+            let session = q("session");
+            let agent = q("agent");
+            let target = collector.resolve(&session, &agent);
+            let body = serde_json::to_vec(&crate::spill::spill(
+                target,
+                num("minutes", 0, 0, 1440),
+                num("limit", 300, 1, 2000) as usize,
+            ))
+            .unwrap_or_default();
+            send(request, body, JSON, 200, None)
+        }
+        "/spill" => send(request, SPILL.as_bytes().to_vec(), HTML, 200, None),
         _ if route.starts_with("/static/") => {
             let name = &route["/static/".len()..];
             match asset(name) {
@@ -278,4 +298,25 @@ fn activity(url: &str) -> serde_json::Value {
             "hint": "populate it with:  alcove --ingest-only",
         }),
     }
+}
+
+/// Minimal percent-decoding for query values. Session ids are hex-and-dashes, so
+/// this exists for the `%2F`-style escapes a browser may still send rather than
+/// for general URL handling.
+fn percent_decode(raw: &str) -> String {
+    let bytes = raw.replace('+', " ").into_bytes();
+    let mut out: Vec<u8> = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%' && i + 2 < bytes.len() {
+            if let Ok(b) = u8::from_str_radix(&String::from_utf8_lossy(&bytes[i + 1..i + 3]), 16) {
+                out.push(b);
+                i += 3;
+                continue;
+            }
+        }
+        out.push(bytes[i]);
+        i += 1;
+    }
+    String::from_utf8_lossy(&out).to_string()
 }

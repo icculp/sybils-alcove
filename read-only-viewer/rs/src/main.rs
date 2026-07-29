@@ -14,11 +14,13 @@
 mod cache;
 mod claude;
 mod codex;
+mod codex_state;
 mod collect;
 mod config;
 mod model;
 mod par;
 mod process;
+mod spill;
 mod store;
 mod transcripts;
 mod web;
@@ -132,10 +134,9 @@ fn main() {
                 label: a.label,
                 model: a.model,
                 role: a.role,
-                // Codex status comes from its private sqlite, which phase 1
-                // does not read; the Python side is run with that enrichment
-                // disabled so the two are compared like for like.
-                status: String::new(),
+                // From the spawn edge in Codex's own sqlite — the only place
+                // open/closed is written down.
+                status: a.status,
                 turns: a.turns,
                 usage: a.usage,
                 task: a.task,
@@ -148,7 +149,7 @@ fn main() {
             label: s.label,
             project: s.project,
             cwd: s.cwd,
-            branch: String::new(),
+            branch: s.branch,
             effort: s.effort,
             model: s.model,
             selected_model: String::new(),
