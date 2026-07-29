@@ -1,0 +1,37 @@
+[Unit]
+Description=Sybil's Alcove — live agent session viewer
+Documentation=https://forgejo.lan/icculp/sybils-alcove
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+# Binding a specific ZeroTier address fails if ztwpxhgxve is not up yet, and on
+# boot it usually is not. Restart rather than order against the ZT unit, so a
+# later interface arrival (or a ZT restart) is self-healing.
+Restart=always
+RestartSec=5s
+EnvironmentFile=/etc/alcove/env
+WorkingDirectory=/root/proj/sybils-alcove/read-only-viewer
+# The Rust build, installed out of the repo on purpose: `cargo build` replaces
+# target/release/alcove in place, so pointing here would swap the binary under a
+# running service on every rebuild. Installing is the deliberate step.
+# The Python it replaced is kept as reference/alcove.py — readable, not run.
+ExecStart=/usr/local/bin/alcove
+StandardOutput=journal
+StandardError=journal
+
+# Read-only tool: it opens transcripts and serves a page. Nothing it does needs
+# write access or privilege.
+ProtectSystem=strict
+ProtectHome=read-only
+PrivateTmp=true
+NoNewPrivileges=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+MemoryMax=512M
+
+[Install]
+WantedBy=multi-user.target
