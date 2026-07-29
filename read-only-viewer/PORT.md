@@ -1,10 +1,10 @@
 # Rust port — status
 
-**Goal:** one static binary plus the JS. Not a hybrid — Python is deleted at the
-end, and this document is deleted with it.
+**Goal:** one static binary plus the JS. The Python is **kept, frozen**, as a
+reference implementation — see `reference/README.md`.
 
-The Python is the shipping implementation until step 3 below lands. Nothing has
-switched over.
+Every layer is ported. What remains is the cutover: pointing the systemd unit at
+the Rust binary.
 
 ## Layers
 
@@ -24,6 +24,10 @@ switched over.
 Python is still what the systemd unit runs, pending the cutover.
 
 ## Order of work
+
+0. ~~normaliser~~, ~~server + pid liveness~~, ~~incremental~~, ~~store~~,
+   ~~spillout~~, ~~Codex sqlite~~, ~~freeze~~ — all done. Remaining: cut the
+   systemd unit over to the Rust binary.
 
 1. **HTTP server + pid liveness** — incremental caching is worthless in a
    one-shot CLI, so the long-lived process has to exist first. At this point the
@@ -85,7 +89,7 @@ implementation.
   `state_*.sqlite` into the fixture and both implementations are pointed at it,
   so neither reads the live file mid-gate.
 
-## Known defect: Codex turn ids collide across threads
+## Fixed: Codex turn ids collide across threads
 
 `turn.id` uses the natural key (`payload.id`), and the store's whole premise is
 that this makes ingestion idempotent. For Codex that premise is 99.7% true and
@@ -101,10 +105,16 @@ That also made the two implementations disagree until Rust sorted subagents the
 way Python does — the surviving row depended on iteration order, which is not a
 property anything should depend on.
 
-The fix is a composite key that records the OWNING thread rather than only the
-parent session, and it is a schema change. Deliberately not made while two
-implementations must agree row for row; it belongs immediately after the Python
-is deleted.
+**Fixed in Rust after the freeze.** `turn` is keyed on `(id, thread_id)`, where
+`thread_id` is the thread that actually produced the turn — the session for a
+main thread, the subagent's own id for a child. Result: 8,787 -> 8,793 rows,
+exactly the 6 that were being dropped, still idempotent (0 new on a second
+ingest), and the worst id is now stored 7 times instead of 1.
+
+The reference keeps the single-column key, so the gate's store check asserts the
+SHAPE of the divergence rather than equality: every reference row must still
+exist in the Rust store, and the only extra rows may be ids the reference
+collapsed.
 
 ## Known complications
 

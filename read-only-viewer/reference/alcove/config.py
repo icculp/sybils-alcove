@@ -50,7 +50,10 @@ TOKEN = os.environ.get("ALCOVE_TOKEN", "")
 COOKIE = "alcove_token"
 LOCAL_BINDS = {"127.0.0.1", "localhost"}
 
-STATIC_DIR = Path(__file__).resolve().parent / "static"
+# The browser UI is SHARED, not part of the reference implementation: it is the
+# live front end the Rust binary serves and the one the Python served. It sits a
+# level up so neither implementation owns it.
+STATIC_DIR = Path(__file__).resolve().parent.parent.parent / "static"
 
 
 def is_local_bind() -> bool:
