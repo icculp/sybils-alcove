@@ -18,6 +18,10 @@ if [ "${1:-}" = "--freeze" ]; then
   rm -rf "$out"; mkdir -p "$out"
   cp -a "${ALCOVE_CLAUDE_ROOT:-$HOME/.claude/projects}" "$out/claude"
   cp -a "${ALCOVE_CODEX_ROOT:-$HOME/.codex/sessions}" "$out/codex"
+  # Codex's own sqlite is enrichment for BOTH implementations now, so it has to
+  # be frozen too — reading the live one would let Codex change it mid-gate.
+  mkdir -p "$out/codex-home"
+  cp -a "${ALCOVE_CODEX_HOME:-$HOME/.codex}"/state_*.sqlite "$out/codex-home/" 2>/dev/null || true
   echo "frozen $(find "$out" -name '*.jsonl' | wc -l) files into $out"
   exit 0
 fi
@@ -28,6 +32,7 @@ fixture="${1:?usage: $0 <fixture-dir>   (or --freeze <dir> to make one)}"
 
 export ALCOVE_CLAUDE_ROOT="$fixture/claude"
 export ALCOVE_CODEX_ROOT="$fixture/codex"
+export ALCOVE_CODEX_HOME="$fixture/codex-home"
 
 tmp="$(mktemp -d)"
 trap 'rm -rf "$tmp"' EXIT
@@ -50,8 +55,7 @@ if diff -q "$tmp/py.json" "$tmp/rs.json" > /dev/null; then
   # Third property: the two stores must agree. The snapshot gate cannot see
   # this — snapshots carry no per-turn rows, so both sides can agree on every
   # aggregate and still write different rows.
-  ALCOVE_DB="$tmp/py.db" ALCOVE_CODEX_HOME=/nonexistent \
-    python3 alcove.py --ingest-only > /dev/null
+  ALCOVE_DB="$tmp/py.db" python3 alcove.py --ingest-only > /dev/null
   ALCOVE_DB="$tmp/rs.db" ./rs/target/release/alcove --ingest-only > /dev/null
   python3 tools/store_equivalence.py "$tmp/py.db" "$tmp/rs.db" || exit 1
   exit 0

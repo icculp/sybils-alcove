@@ -35,9 +35,13 @@ pub struct Scan {
     pub size: u64,
     pub age_s: Option<f64>,
     pub live: bool,
+    pub spawn_status: String,
+    pub branch: String,
 }
 
 pub struct SubAgent {
+    pub status: String,
+    pub nickname: String,
     pub turn_rows: Vec<TurnRow>,
     pub age_s: Option<f64>,
     pub live: bool,
@@ -52,6 +56,8 @@ pub struct SubAgent {
 }
 
 pub struct Session {
+    pub branch: String,
+    pub nickname: String,
     pub turn_rows: Vec<TurnRow>,
     pub session_id: String,
     pub label: String,
@@ -235,6 +241,8 @@ pub fn scan(path: &Path) -> Scan {
         size: file_size(path),
         age_s: None,
         live: false,
+        spawn_status: String::new(),
+        branch: String::new(),
         path: path.to_path_buf(),
     }
 }
@@ -359,6 +367,33 @@ pub fn collect(root: &Path, cache: &ScanCache<Scan>) -> Vec<Session> {
         }
     }
 
+    // Codex's own sqlite, if readable. Transcript facts always win: the rollout
+    // is what actually happened, and this is a convenience index over it. It
+    // fills gaps — the open/closed status transcripts never record, a branch, an
+    // effort. Absent or reshaped, every value below stays as it was.
+    let state = crate::codex_state::read();
+    for info in merged.iter_mut() {
+        let meta = state.threads.get(&info.session_id);
+        let edge = state.edges.get(&info.session_id);
+        if info.role.is_empty() {
+            info.role = meta.map(|m| m.role.clone()).unwrap_or_default();
+        }
+        if info.nickname.is_empty() {
+            info.nickname = meta.map(|m| m.nickname.clone()).unwrap_or_default();
+        }
+        if info.parent.is_empty() {
+            info.parent = edge.map(|e| e.parent.clone()).unwrap_or_default();
+        }
+        if info.effort.is_empty() {
+            info.effort = meta.map(|m| m.effort.clone()).unwrap_or_default();
+        }
+        if info.model.is_empty() {
+            info.model = meta.map(|m| m.model.clone()).unwrap_or_default();
+        }
+        info.spawn_status = edge.map(|e| e.status.clone()).unwrap_or_default();
+        info.branch = meta.map(|m| m.branch.clone()).unwrap_or_default();
+    }
+
     let mut children: HashMap<String, Vec<usize>> = HashMap::new();
     for (i, info) in merged.iter().enumerate() {
         if !info.parent.is_empty() {
@@ -374,6 +409,10 @@ pub fn collect(root: &Path, cache: &ScanCache<Scan>) -> Vec<Session> {
         for &ci in children.get(&info.session_id).unwrap_or(&Vec::new()) {
             let child = &merged[ci];
             subs.push(SubAgent {
+                // Codex records no completion in the transcript; the spawn edge is
+                // the only place open/closed is written down.
+                status: child.spawn_status.clone(),
+                nickname: child.nickname.clone(),
                 turn_rows: child.turn_rows.clone(),
                 age_s: child.age_s,
                 live: child.live,
@@ -397,6 +436,8 @@ pub fn collect(root: &Path, cache: &ScanCache<Scan>) -> Vec<Session> {
         });
         let _ = i;
         sessions.push(Session {
+            branch: info.branch.clone(),
+            nickname: info.nickname.clone(),
             turn_rows: info.turn_rows.clone(),
             // Codex thread ids are time-ordered, so two sessions started in the
             // same window share an 8-char prefix and read as one duplicated row.

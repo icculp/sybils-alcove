@@ -6,8 +6,8 @@ ages, liveness, pids, process state — is excluded, because those differ betwee
 two runs of the same implementation and would drown the signal. What remains is
 the parsing facts, which is what a port can get wrong.
 
-Codex's private sqlite is disabled here (phase 1 of the Rust core does not read
-it), so the two sides are compared like for like.
+Codex's private sqlite is now read by both implementations, so the gate points
+them at the frozen copy inside the fixture.
 """
 
 from __future__ import annotations
@@ -17,9 +17,9 @@ import os
 import sys
 from pathlib import Path
 
-# Disable the Codex sqlite enrichment BEFORE alcove.config is imported.
-os.environ["ALCOVE_CODEX_HOME"] = "/nonexistent-for-equivalence"
-
+# ALCOVE_CODEX_HOME is honoured from the environment: the gate points BOTH
+# implementations at the frozen copy in the fixture, so the Codex sqlite
+# enrichment is compared rather than switched off.
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from alcove.sources.claude import collect_claude  # noqa: E402
