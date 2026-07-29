@@ -11,3 +11,6 @@ DESIGN.md
 
 # Rust build output.
 target/
+
+# Scoped worktrees live in-repo so the branch and its checkout stay together.
+.worktrees/

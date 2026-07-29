@@ -3,31 +3,46 @@
 **Goal:** one static binary plus the JS. The Python is **kept, frozen**, as a
 reference implementation — see `reference/README.md`.
 
-Every layer is ported. What remains is the cutover: pointing the systemd unit at
-the Rust binary.
+**The port is done.** Every layer is in Rust and the systemd unit runs the Rust
+binary.
 
 ## Layers
 
 | layer | Python | Rust | ships today |
 |---|---|---|---|
-| transcript read / normalise | ✅ | ✅ | Python |
-| incremental scan | ⬜ | ✅ | — (Rust only, by decision) |
-| HTTP server + `/api/sessions` | ✅ | ✅ | Python |
-| pid liveness | ✅ | ✅ | Python |
-| store (sqlite) + `/api/activity` | ✅ | ✅ | Python |
-| spillout | ✅ | ✅ | Python |
-| activity | ✅ | ✅ | Python |
-| Codex `state_<N>.sqlite` | ✅ | ✅ | Python |
-| browser UI (JS/CSS) | — | — | stays as-is, not ported |
+| transcript read / normalise | ✅ | ✅ | Rust |
+| incremental scan | ⬜ | ✅ | Rust (Rust only, by decision) |
+| HTTP server + `/api/sessions` | ✅ | ✅ | Rust |
+| pid liveness | ✅ | ✅ | Rust |
+| store (sqlite) + `/api/activity` | ✅ | ✅ | Rust |
+| spillout | ✅ | ✅ | Rust |
+| activity | ✅ | ✅ | Rust |
+| Codex `state_<N>.sqlite` | ✅ | ✅ | Rust |
+| browser UI (JS/CSS) | — | — | shared `static/`, not ported |
 
-**Every route is now ported.** The Rust binary serves the whole viewer; the
-Python is still what the systemd unit runs, pending the cutover.
+The Python is kept as `reference/` — readable, runnable, never run in anger.
+
+## Deploying
+
+`deploy/alcove.service` is a copy of the installed unit. The binary is installed
+**out of the repo**:
+
+    cargo build --release
+    install -m 0755 rs/target/release/alcove /usr/local/bin/alcove
+    systemctl restart alcove
+
+`cargo build` replaces `target/release/alcove` in place, so an `ExecStart`
+pointing into the repo would swap the binary under the running service on every
+rebuild. Installing is the deliberate step that says "ship this one."
+
+The unit keeps `ProtectHome=read-only` — which is precisely what the read-only
+store open and the copy-then-immutable Codex sqlite read were built for.
 
 ## Order of work
 
 0. ~~normaliser~~, ~~server + pid liveness~~, ~~incremental~~, ~~store~~,
-   ~~spillout~~, ~~Codex sqlite~~, ~~freeze~~ — all done. Remaining: cut the
-   systemd unit over to the Rust binary.
+   ~~spillout~~, ~~Codex sqlite~~, ~~freeze~~, ~~cutover~~ — the port is
+   complete.
 
 1. **HTTP server + pid liveness** — incremental caching is worthless in a
    one-shot CLI, so the long-lived process has to exist first. At this point the
@@ -46,9 +61,9 @@ Python is still what the systemd unit runs, pending the cutover.
    incrementality stays available if that is ever not enough.
 3. ~~**store**~~ — done. rusqlite bundled; `--ingest-only` and `/api/activity`.
 4. ~~spillout, Codex sqlite~~ — done.
-5. **freeze** the Python as a reference implementation, cut the unit over to the
-   Rust binary, then fix the `turn.id` collision (a deliberate divergence, so it
-   has to come after the freeze).
+5. ~~**freeze** the Python as a reference implementation, cut the unit over to
+   the Rust binary, then fix the `turn.id` collision~~ — done, in that order.
+   The id fix is a deliberate divergence, so it had to come after the freeze.
 
 ## The equivalence gate
 
