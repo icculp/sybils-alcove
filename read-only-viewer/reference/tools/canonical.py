@@ -20,7 +20,7 @@ from pathlib import Path
 # ALCOVE_CODEX_HOME is honoured from the environment: the gate points BOTH
 # implementations at the frozen copy in the fixture, so the Codex sqlite
 # enrichment is compared rather than switched off.
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))  # reference/
 
 from alcove.sources.claude import collect_claude  # noqa: E402
 from alcove.sources.codex import collect_codex  # noqa: E402

@@ -11,7 +11,8 @@
 #   tools/equivalence.sh --freeze /path/to/out # snapshot the live corpus first
 set -euo pipefail
 
-cd "$(dirname "$0")/.."
+# reference/tools -> read-only-viewer
+cd "$(dirname "$0")/../.."
 
 if [ "${1:-}" = "--freeze" ]; then
   out="${2:?usage: $0 --freeze <dir>}"
@@ -37,7 +38,7 @@ export ALCOVE_CODEX_HOME="$fixture/codex-home"
 tmp="$(mktemp -d)"
 trap 'rm -rf "$tmp"' EXIT
 
-python3 tools/canonical.py > "$tmp/py.json"
+python3 reference/tools/canonical.py > "$tmp/py.json"
 ./rs/target/release/alcove --snapshot > "$tmp/rs.json"
 
 if diff -q "$tmp/py.json" "$tmp/rs.json" > /dev/null; then
@@ -55,9 +56,9 @@ if diff -q "$tmp/py.json" "$tmp/rs.json" > /dev/null; then
   # Third property: the two stores must agree. The snapshot gate cannot see
   # this — snapshots carry no per-turn rows, so both sides can agree on every
   # aggregate and still write different rows.
-  ALCOVE_DB="$tmp/py.db" python3 alcove.py --ingest-only > /dev/null
+  ALCOVE_DB="$tmp/py.db" python3 reference/alcove.py --ingest-only > /dev/null
   ALCOVE_DB="$tmp/rs.db" ./rs/target/release/alcove --ingest-only > /dev/null
-  python3 tools/store_equivalence.py "$tmp/py.db" "$tmp/rs.db" || exit 1
+  python3 reference/tools/store_equivalence.py "$tmp/py.db" "$tmp/rs.db" || exit 1
   exit 0
 fi
 

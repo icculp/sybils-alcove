@@ -15,16 +15,16 @@ use crate::collect::Collector;
 use crate::store;
 use crate::config::{Config, COOKIE};
 
-const INDEX: &str = include_str!("../../alcove/static/index.html");
-const LOGIN: &str = include_str!("../../alcove/static/login.html");
-const APP_JS: &str = include_str!("../../alcove/static/app.js");
-const APP_CSS: &str = include_str!("../../alcove/static/app.css");
-const ACTIVITY: &str = include_str!("../../alcove/static/activity.html");
-const ACTIVITY_JS: &str = include_str!("../../alcove/static/activity.js");
-const ACTIVITY_CSS: &str = include_str!("../../alcove/static/activity.css");
-const SPILL: &str = include_str!("../../alcove/static/spill.html");
-const SPILL_JS: &str = include_str!("../../alcove/static/spill.js");
-const SPILL_CSS: &str = include_str!("../../alcove/static/spill.css");
+const INDEX: &str = include_str!("../../static/index.html");
+const LOGIN: &str = include_str!("../../static/login.html");
+const APP_JS: &str = include_str!("../../static/app.js");
+const APP_CSS: &str = include_str!("../../static/app.css");
+const ACTIVITY: &str = include_str!("../../static/activity.html");
+const ACTIVITY_JS: &str = include_str!("../../static/activity.js");
+const ACTIVITY_CSS: &str = include_str!("../../static/activity.css");
+const SPILL: &str = include_str!("../../static/spill.html");
+const SPILL_JS: &str = include_str!("../../static/spill.js");
+const SPILL_CSS: &str = include_str!("../../static/spill.css");
 
 const HTML: &str = "text/html; charset=utf-8";
 const JSON: &str = "application/json";
