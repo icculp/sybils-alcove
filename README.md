@@ -8,6 +8,9 @@ Tooling for watching — and eventually working with — local coding-agent sess
 | --- | --- |
 | [`read-only-viewer/`](read-only-viewer/) | A live web view of local Claude Code and Codex sessions: which model is actually serving each one, what it spawned, and what that cost. Read-only by construction. |
 
+<img width="1900" height="961" alt="image" src="https://github.com/user-attachments/assets/fadbf655-8572-4d5c-9778-301379828a1d" />
+
+
 ## Why the folder is named that
 
 The viewer never writes a transcript and never calls a model API. That is a
