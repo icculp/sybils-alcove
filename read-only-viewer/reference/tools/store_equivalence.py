@@ -18,9 +18,9 @@ from __future__ import annotations
 import sqlite3
 import sys
 
+# `turn` is checked separately: the two implementations DELIBERATELY differ there
+# after the freeze (see reference/README.md).
 TABLES = {
-    "turn": "select id,session_id,harness,ts,model,input,output,cache_read,"
-            "cache_write,is_subagent from turn order by id",
     "selection": "select session_id,ts,model,requested from selection"
                  " order by session_id,ts,model",
     "compaction": "select session_id,ts,trigger,pre_tokens from compaction"
@@ -30,9 +30,48 @@ TABLES = {
 }
 
 
+COLS = ("id,session_id,harness,ts,model,input,output,cache_read,cache_write,"
+        "is_subagent")
+
+
+def check_turns(py: sqlite3.Connection, rs: sqlite3.Connection) -> bool:
+    """The one documented divergence: the reference keys `turn` on id alone.
+
+    A spawned Codex agent inherits the parent's replayed history, so one message
+    id appears in the parent and every child. Keyed on id alone they collide and
+    the reference silently keeps whichever landed first; the Rust store keys on
+    (id, thread_id) and keeps them all.
+
+    So this is not an equality check. It asserts the shape of the divergence:
+    every reference row still exists in the Rust store, and the only extra rows
+    are ids the reference collapsed.
+    """
+    a = set(py.execute(f"select {COLS} from turn"))
+    b = set(rs.execute(f"select {COLS} from turn"))
+    missing = a - b
+    extra = b - a
+    collapsed = {row[0] for row in extra}
+    print(f"  turn        reference={len(a):5} rust={len(b):5}  "
+          f"+{len(extra)} recovered, {len(missing)} missing")
+    if missing:
+        for row in list(missing)[:3]:
+            print("     in reference but NOT rust:", str(row)[:130])
+        return False
+    # Every extra row must be a duplicate id the reference could not store.
+    dupes = {i for (i,) in rs.execute(
+        "select id from turn group by id having count(*) > 1")}
+    stray = collapsed - dupes
+    if stray:
+        print("     unexplained extra ids:", list(stray)[:3])
+        return False
+    print(f"     divergence is exactly the id collision "
+          f"({len(dupes)} id(s) stored per-thread)")
+    return True
+
+
 def main(py_db: str, rs_db: str) -> int:
     py, rs = sqlite3.connect(py_db), sqlite3.connect(rs_db)
-    ok = True
+    ok = check_turns(py, rs)
     for label, sql in TABLES.items():
         a, b = py.execute(sql).fetchall(), rs.execute(sql).fetchall()
         same = a == b

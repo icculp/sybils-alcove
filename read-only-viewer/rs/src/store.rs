@@ -21,8 +21,17 @@ use rusqlite::{params, Connection, OpenFlags};
 use serde_json::{json, Value};
 
 pub const SCHEMA: &str = r#"
+-- The key is (id, thread_id), NOT id alone. A spawned Codex agent inherits the
+-- parent's replayed history, so the same assistant message id appears in the
+-- parent AND in every child, all stored under the parent's session_id. Keyed on
+-- id alone they collide and INSERT OR IGNORE keeps whichever lands first:
+-- measured at 6 rows silently dropped of 1,967, worst id appearing 7 times
+-- across 7 threads, with the survivor depending on iteration order.
+-- `thread_id` is the thread that actually produced the turn — the session for a
+-- main thread, the subagent's own id for a child.
 CREATE TABLE IF NOT EXISTS turn (
-  id          TEXT PRIMARY KEY,
+  id          TEXT NOT NULL,
+  thread_id   TEXT NOT NULL DEFAULT '',
   session_id  TEXT NOT NULL,
   harness     TEXT NOT NULL,
   ts          TEXT,
@@ -31,7 +40,8 @@ CREATE TABLE IF NOT EXISTS turn (
   output      INTEGER,
   cache_read  INTEGER,
   cache_write INTEGER,
-  is_subagent INTEGER NOT NULL DEFAULT 0
+  is_subagent INTEGER NOT NULL DEFAULT 0,
+  PRIMARY KEY (id, thread_id)
 );
 CREATE INDEX IF NOT EXISTS turn_session_ts ON turn(session_id, ts);
 CREATE INDEX IF NOT EXISTS turn_ts         ON turn(ts);
@@ -146,10 +156,17 @@ pub struct Counts {
     pub subagent_seen: i64,
 }
 
-fn turn_params(row: &Value, sid: &str, harness: &str, is_sub: i64) -> Option<Vec<Value>> {
+fn turn_params(
+    row: &Value,
+    sid: &str,
+    thread_id: &str,
+    harness: &str,
+    is_sub: i64,
+) -> Option<Vec<Value>> {
     let id = row.get("id")?.as_str()?.to_string();
     Some(vec![
         json!(id),
+        json!(thread_id),
         json!(sid),
         json!(harness),
         row.get("ts").cloned().unwrap_or(Value::Null),
@@ -196,9 +213,9 @@ pub fn ingest(conn: &mut Connection, snapshot: &Value) -> Result<Counts, Unavail
             let mut stmt = tx
                 .prepare(
                     r#"INSERT OR IGNORE INTO turn
-                         (id, session_id, harness, ts, model, input, output,
-                          cache_read, cache_write, is_subagent)
-                       VALUES (?,?,?,?,?,?,?,?,?,?)"#,
+                         (id, thread_id, session_id, harness, ts, model, input,
+                          output, cache_read, cache_write, is_subagent)
+                       VALUES (?,?,?,?,?,?,?,?,?,?,?)"#,
                 )
                 .map_err(|e| Unavailable(e.to_string()))?;
             for session in sessions {
@@ -207,7 +224,8 @@ pub fn ingest(conn: &mut Connection, snapshot: &Value) -> Result<Counts, Unavail
                 let own = session.get("turn_rows").and_then(Value::as_array).cloned()
                     .unwrap_or_default();
                 for row in &own {
-                    if let Some(p) = turn_params(row, sid, harness, 0) {
+                    // A main thread owns its own turns.
+                    if let Some(p) = turn_params(row, sid, sid, harness, 0) {
                         let boxed: Vec<Box<dyn rusqlite::ToSql>> = p.iter().map(bind).collect();
                         let refs: Vec<&dyn rusqlite::ToSql> =
                             boxed.iter().map(|b| b.as_ref()).collect();
@@ -218,8 +236,10 @@ pub fn ingest(conn: &mut Connection, snapshot: &Value) -> Result<Counts, Unavail
                 for sub in
                     session.get("subagents").and_then(Value::as_array).unwrap_or(&empty)
                 {
+                    let child = sub.get("id").and_then(Value::as_str).unwrap_or("");
                     for row in sub.get("turn_rows").and_then(Value::as_array).unwrap_or(&empty) {
-                        if let Some(p) = turn_params(row, sid, harness, 1) {
+                        // The OWNING thread is the subagent, not its parent.
+                        if let Some(p) = turn_params(row, sid, child, harness, 1) {
                             let boxed: Vec<Box<dyn rusqlite::ToSql>> =
                                 p.iter().map(bind).collect();
                             let refs: Vec<&dyn rusqlite::ToSql> =
