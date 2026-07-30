@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
-"""Observation-only tool-call hook: append one JSON line per tool event.
+"""Observation-only session hook: append one JSON line per tool or stop event.
 
-Reads a Claude Code or Codex PreToolUse/PostToolUse hook payload on stdin and
-appends a single capped line to an append-only spool a separate ingester reads.
+Reads a Claude Code or Codex PreToolUse / PostToolUse / Stop / SubagentStop hook
+payload on stdin and appends a single capped line to an append-only spool a
+separate ingester reads.
 
 The only failure mode this is allowed to have is "a line is missing". It makes
 no decisions, blocks nothing, opens no socket, and always exits 0 -- a hook that
@@ -17,6 +18,16 @@ import sys
 SPOOL_DIR = "/root/.local/state/alcove/spool"
 
 SCHEMA_VERSION = 1
+
+EVENT_MAP = {
+    "PreToolUse": "pre",
+    "PostToolUse": "post",
+    # A stop is a state transition, not a tombstone: a later event for the same
+    # session or child means it resumed. This records; the viewer interprets.
+    "Stop": "stop",
+    "SubagentStop": "subagent_stop",
+}
+
 MAX_LINE = 2048  # hard cap, bytes
 MAX_ARG = 500  # hard cap, chars
 MAX_TARGET = 500
@@ -212,17 +223,40 @@ def main():
         return
 
     event_name = payload.get("hook_event_name")
-    event = {"PreToolUse": "pre", "PostToolUse": "post"}.get(event_name)
+    event = EVENT_MAP.get(event_name)
     if event is None:
         return  # not ours; say nothing
 
     harness = _harness(payload)
     ts, now = _timestamp()
-    target, arg = _extract(payload.get("tool_input"))
-    if arg:
-        arg = _redact(arg)[:MAX_ARG]
-    if target:
-        target = _redact(target)[:MAX_TARGET]
+
+    if event in ("stop", "subagent_stop"):
+        # A turn or a child ended. `tool` stays "" rather than null: the merged
+        # ingester types it `String`, and a null there fails deserialization and
+        # drops the line -- which would lose the very event this exists for.
+        tool = ""
+        tool_use_id = None
+        ok = None
+        if event == "subagent_stop":
+            # `session_id` is the PARENT's and `transcript_path` is the PARENT's
+            # transcript. The child is named by `agent_id`, and its own
+            # transcript is a SEPARATE field, `agent_transcript_path`.
+            target = _str(payload.get("agent_id"), MAX_FIELD)
+            arg = _str(payload.get("agent_transcript_path"), MAX_ARG)
+        else:
+            target = None
+            arg = None
+        # No redaction here: both are harness-generated ids and paths, never
+        # user text, and a mangled child id would defeat the point.
+    else:
+        tool = _str(payload.get("tool_name"), MAX_FIELD) or ""
+        tool_use_id = _str(payload.get("tool_use_id"), MAX_FIELD)
+        ok = _determine_ok(payload) if event == "post" else None
+        target, arg = _extract(payload.get("tool_input"))
+        if arg:
+            arg = _redact(arg)[:MAX_ARG]
+        if target:
+            target = _redact(target)[:MAX_TARGET]
 
     record = {
         "v": SCHEMA_VERSION,
@@ -230,12 +264,12 @@ def main():
         "harness": harness,
         "event": event,
         "session_id": _str(payload.get("session_id"), MAX_FIELD) or "",
-        "tool": _str(payload.get("tool_name"), MAX_FIELD) or "",
+        "tool": tool,
         "cwd": _str(payload.get("cwd"), MAX_TARGET),
         "target": target,
         "arg": arg,
-        "ok": _determine_ok(payload) if event == "post" else None,
-        "tool_use_id": _str(payload.get("tool_use_id"), MAX_FIELD),
+        "ok": ok,
+        "tool_use_id": tool_use_id,
     }
 
     def encode(rec):

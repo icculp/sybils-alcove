@@ -1,9 +1,10 @@
 # `hooks/` — the tool-call spool
 
 `alcove_spool_hook.py` is an observation-only hook. A harness runs it before and
-after every tool call; it appends one line describing the call to a spool file
-and exits. A separate ingester consumes the spool. The hook makes no decisions,
-blocks nothing, opens no socket, and reads no tool output body.
+after every tool call, and again when a turn or a subagent ends; it appends one
+line describing the event to a spool file and exits. A separate ingester consumes
+the spool. The hook makes no decisions, blocks nothing, opens no socket, and reads
+no tool output or assistant message body.
 
 **Its only permitted failure mode is "a line is missing."** The entire body is
 wrapped in `try/except BaseException` and it always `exit(0)` — a tool hook that
@@ -21,14 +22,14 @@ written with a single `O_APPEND` `write()` of at most **2048 bytes**.
 | `v` | int | schema version, currently `1` |
 | `ts` | str | ISO8601 UTC with milliseconds, `2026-07-30T13:30:57.243Z` |
 | `harness` | `"claude"` \| `"codex"` | which agent harness emitted the event |
-| `event` | `"pre"` \| `"post"` | PreToolUse or PostToolUse |
+| `event` | `"pre"` \| `"post"` \| `"stop"` \| `"subagent_stop"` | which hook fired |
 | `session_id` | str | harness session id (`""` if the payload omitted it) |
-| `tool` | str | tool name (`""` if the payload omitted it) |
+| `tool` | str | tool name; `""` on stop-family events |
 | `cwd` | str \| null | harness-reported working directory |
-| `target` | str \| null | `file_path`, or the path-like primary argument, if the tool has one |
-| `arg` | str \| null | head of the primary argument, ≤500 chars; for a shell tool this is the command head |
-| `ok` | bool \| null | post events only; `null` when not cheaply determinable |
-| `tool_use_id` | str \| null | the harness's own id for the call |
+| `target` | str \| null | tool events: `file_path` or the path-like primary argument. `subagent_stop`: the child's `agent_id` |
+| `arg` | str \| null | tool events: head of the primary argument, ≤500 chars (for a shell tool, the command head). `subagent_stop`: the child's transcript path |
+| `ok` | bool \| null | `post` only; `null` when not cheaply determinable |
+| `tool_use_id` | str \| null | the harness's own id for the call; `null` on stop-family events |
 
 Caps are hard, not advisory: `arg` and `target` ≤500 chars, `tool` /
 `session_id` / `tool_use_id` ≤200, and the assembled line ≤2048 bytes. If a line
@@ -38,11 +39,66 @@ that is still not enough does it drop the line.
 Duplicate-safety and ordering are the ingester's problem. The hook writes what it
 sees, when it sees it; concurrent sessions interleave in one file.
 
+### `stop` and `subagent_stop`
+
+These exist because liveness inferred from transcript mtime is wrong for minutes
+at a time: a finished subagent keeps rendering as active until its file ages out
+of the window. A stop event is the authoritative "done, now" signal.
+
+**A stop is a state transition, not a tombstone.** A later event for the same
+`session_id` — or the same `subagent_stop` `target` — means it resumed. The hook
+records transitions; the viewer decides what the latest one means. Nothing here
+should be read as "this session is gone forever."
+
+`tool` is `""` on these lines, **not `null`**, and that is deliberate: the merged
+ingester types the field `String`, so a `null` fails deserialization and the line
+is dropped — losing exactly the event this was added for. An empty string
+round-trips under both that type and a later `Option<String>`.
+
+#### Identifying the child (verified, and not what it looks like)
+
+The `subagent_stop` payload names the child in `agent_id` and gives the child's
+own transcript in **`agent_transcript_path`**. Its `session_id` and
+`transcript_path` are the **parent's** — `transcript_path` does *not* point at
+`agent-<id>.jsonl`. Reading it as the child's transcript is the exact class of
+mistake this repo keeps paying for, so, from a real capture:
+
+```json
+{
+  "hook_event_name": "SubagentStop",
+  "session_id": "8fcd8b00-…",                                     // PARENT
+  "transcript_path": "/root/.claude/projects/-root-proj-sybils-alcove/8fcd8b00-….jsonl",   // PARENT
+  "agent_id": "a409d7dba26431ed6",                                // the child
+  "agent_type": "Explore",
+  "agent_transcript_path": "/root/.claude/projects/-root-proj-sybils-alcove/8fcd8b00-…/subagents/agent-a409d7dba26431ed6.jsonl",
+  "cwd": "/root/proj/sybils-alcove", "stop_hook_active": false,
+  "last_assistant_message": "…", "background_tasks": [], "session_crons": []
+}
+```
+
+So `target` = `agent_id`, `arg` = `agent_transcript_path`. The child transcript
+path was confirmed to exist on disk, and its basename contains `target`. `Stop`
+carries no agent fields at all, so its `target` and `arg` are `null`; the payload
+does have the session's own `transcript_path`, which the contract does not spool.
+
+Codex's `subagent-stop.command.input` schema **requires the same three field
+names** (`agent_id`, `agent_transcript_path`, `agent_type`), so one mapping serves
+both harnesses.
+
+`agent_type` (`Explore`, `general-purpose`, `spark-triage`, …) is present in both
+harnesses' payloads and has **no field in the contract**, so it is not spooled. If
+the viewer wants to label a stopped child by kind, that is a v2 field — it is not
+smuggled into `tool`.
+
+`last_assistant_message` is a message body and is never read.
+
 ### What never reaches the spool
 
 No `tool_response` body, no environment variables, no file contents, no message
 or prompt bodies.
 
+- Only `tool_input` is ever mined for content, so `last_assistant_message` on the
+  stop-family events has no path to the spool at all.
 - `arg` is taken from a **whitelist** of `tool_input` keys, not "the first key":
   `command`, `cmd`, `pattern`, `query`, `search_query`, `url`, `skill`,
   `file_path`, `notebook_path`, `path`, `filePath`, `description`. So `Write`
@@ -65,6 +121,9 @@ or prompt bodies.
   `echo [redacted]` and `--sort-key=name` loses `name`. Losing a shell comment is
   an acceptable price for never spooling a bearer token out of a `curl` line;
   the reverse trade is not available.
+
+  Stop-family `target`/`arg` skip the scrub: they are harness-generated ids and
+  paths, never user text, and a mangled child id would defeat the point.
 
 ### Known floors
 
@@ -154,10 +213,24 @@ before and after.
 "PostToolUse": [ … same … ]
 ```
 
+`Stop` and `SubagentStop` already carry a Hindsight hook. **Multiple hooks per
+event are supported — append a second group, do not replace theirs:**
+
+```json
+"Stop": [
+  { "hooks": [ { …existing hindsight-retain… } ] },
+  { "hooks": [ { "type": "command",
+                 "command": "python3 /root/proj/sybils-alcove/hooks/alcove_spool_hook.py --harness claude",
+                 "timeout": 5 } ] }
+],
+"SubagentStop": [ … same two groups … ]
+```
+
 Synchronous on purpose. `"async": true` would remove the ~25 ms from the session's
-critical path, but async hook processes race the harness's teardown — in `claude -p`
-runs the async Hindsight `Stop` hook is killed before it can log — and an
-observation hook that silently loses its tail is worse than one that costs 25 ms.
+critical path, but async hook processes race the harness's teardown — the async
+Hindsight `Stop` hook is sometimes killed before it can log in short `claude -p`
+runs — and an observation hook that silently loses its tail is worse than one that
+costs 25 ms.
 
 ### Codex — `~/.codex/config.toml`
 
@@ -167,19 +240,35 @@ carries `PreToolUse`/`PostToolUse` handling end to end (`"Before a tool
 executes"` / `"After a tool executes"` in its hook-management UI, plus
 `PreToolUseHookSpecificOutputWire` and `"Command blocked by PreToolUse hook"`).
 
+All four events go in `[hooks]`, and they must appear **before** the
+`[hooks.state]` table header — once that header opens, bare keys belong to it.
+`Stop` and `SubagentStop` already hold a Hindsight hook; append a second group
+rather than replacing it, which also keeps the existing hook at index `0` so its
+`trusted_hash` stays valid.
+
 ```toml
 [hooks]
+Stop = [{ hooks = [{ …existing hindsight-retain… }] }, { hooks = [{ type = "command", command = "python3 /root/proj/sybils-alcove/hooks/alcove_spool_hook.py --harness codex", timeout = 5 }] }]
+SubagentStop = [{ hooks = [{ …existing hindsight-retain… }] }, { hooks = [{ type = "command", command = "python3 /root/proj/sybils-alcove/hooks/alcove_spool_hook.py --harness codex", timeout = 5 }] }]
 PreToolUse = [{ hooks = [{ type = "command", command = "python3 /root/proj/sybils-alcove/hooks/alcove_spool_hook.py --harness codex", timeout = 5 }] }]
 PostToolUse = [{ hooks = [{ type = "command", command = "python3 /root/proj/sybils-alcove/hooks/alcove_spool_hook.py --harness codex", timeout = 5 }] }]
 ```
 
 **A newly added Codex hook does not run until it is acknowledged in the TUI.**
 Codex keys trust on a `trusted_hash` under
-`[hooks.state."<config path>:<event>:<i>:<j>"]` and shows an unacknowledged entry
-as *"New hook — review required"* / *"1 hook needs review before it can run."*
-The hash is Codex's to compute: launch `codex`, open the hooks review, and trust
-the two new entries. Do not hand-write a `trusted_hash` — a guessed hash either
-fails closed or defeats the mechanism.
+`[hooks.state."<config path>:<event>:<i>:<j>"]` — note the **snake_case** event in
+the state key (`stop:0:0`) against the PascalCase config key — and shows an
+unacknowledged entry as *"New hook — review required"* / *"1 hook needs review
+before it can run."* The hash is Codex's to compute: launch `codex`, open the hooks
+review, and trust the new entries. Do not hand-write a `trusted_hash` — a guessed
+hash either fails closed or defeats the mechanism.
+
+Measured, not assumed: a `codex exec` turn after wiring ran the pre-existing
+trusted Stop hook (it prints `hook: Stop`) and wrote **no** spool line, and no new
+`[hooks.state]` entry appeared. So the Codex side is **wired and unacknowledged**;
+its `PreToolUse`, `PostToolUse`, `Stop[1]` and `SubagentStop[1]` entries stay inert
+until someone trusts them in the TUI. The mapping itself was exercised by replaying
+payloads built from Codex's own required-field schemas.
 
 ## Verifying
 
@@ -200,7 +289,26 @@ for f in glob.glob("/root/.local/state/alcove/spool/*.jsonl"):
         d = json.loads(line)
         assert set(d) == {"v","ts","harness","event","session_id","tool",
                           "cwd","target","arg","ok","tool_use_id"}, (f, i)
+        assert d["event"] in {"pre","post","stop","subagent_stop"}, (f, i)
         assert d["event"] == "post" or d["ok"] is None, (f, i)
+        if d["event"] in {"stop","subagent_stop"}:
+            assert d["tool"] == "" and d["tool_use_id"] is None, (f, i)
 print("ok")
+PY
+```
+
+For the stop-family events, run a turn that spawns a subagent
+(`claude -p "use the Agent tool with subagent_type Explore to …"`) and confirm a
+subagent actually ran before trusting the capture. A `subagent_stop` line should
+name a child whose transcript exists:
+
+```sh
+python3 - <<'PY'
+import glob, json, os
+for f in glob.glob("/root/.local/state/alcove/spool/*.jsonl"):
+    for line in open(f):
+        d = json.loads(line)
+        if d["event"] == "subagent_stop":
+            print(d["target"], os.path.exists(d["arg"] or ""), d["arg"])
 PY
 ```
