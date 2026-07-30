@@ -1,0 +1,13 @@
+[Unit]
+Description=Run the Sybil's Alcove ingest every 5 minutes
+Documentation=https://forgejo.lan/icculp/sybils-alcove
+
+[Timer]
+OnBootSec=2min
+OnUnitActiveSec=5min
+# No Persistent=: ingest is a full rescan of the transcripts on disk, so a
+# missed run costs nothing and the next one backfills it. Catching up on boot
+# would just run the same scan twice.
+
+[Install]
+WantedBy=timers.target

@@ -38,6 +38,12 @@ rebuild. Installing is the deliberate step that says "ship this one."
 The unit keeps `ProtectHome=read-only` — which is precisely what the read-only
 store open and the copy-then-immutable Codex sqlite read were built for.
 
+`deploy/alcove-ingest.{service,timer}` keep the store fresh: `--ingest-only`
+every 5 minutes under the same sandbox plus `ReadWritePaths` for the store and
+`IPAddressDeny=any`, since ingest is entirely local. Nothing else schedules it,
+so without the timer the store silently stops at whenever it was last run by
+hand.
+
 ## Order of work
 
 0. ~~normaliser~~, ~~server + pid liveness~~, ~~incremental~~, ~~store~~,

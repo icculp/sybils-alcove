@@ -1,0 +1,33 @@
+[Unit]
+Description=Sybil's Alcove — ingest transcripts into the activity store
+Documentation=https://forgejo.lan/icculp/sybils-alcove
+
+[Service]
+Type=oneshot
+# Optional: ingest needs no token and no bind address — it reads transcripts and
+# writes the store. The `-` keeps the timer working on a host that never
+# configured the server.
+EnvironmentFile=-/etc/alcove/env
+WorkingDirectory=/root/proj/sybils-alcove/read-only-viewer
+ExecStart=/usr/local/bin/alcove --ingest-only
+StandardOutput=journal
+StandardError=journal
+
+# Same sandbox as alcove.service, with one hole: the store. Everything else the
+# ingest touches — transcripts, the Codex state copy, the claude CLI it shells
+# out to for liveness — is read-only or under PrivateTmp.
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=/root/.local/state/alcove
+PrivateTmp=true
+NoNewPrivileges=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+# Ingest is entirely local, so deny the network outright. Verified rather than
+# assumed: `claude agents --json --all` (the liveness lookup) still exits 0 with
+# parseable JSON under IPAddressDeny=any, and a full rescan of the 983 MB corpus
+# completes inside the 512M ceiling.
+IPAddressDeny=any
+MemoryMax=512M
