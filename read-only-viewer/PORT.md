@@ -137,6 +137,19 @@ SHAPE of the divergence rather than equality: every reference row must still
 exist in the Rust store, and the only extra rows may be ids the reference
 collapsed.
 
+**A store created before the fix is only half-fixed, and stays that way.** Its
+`turn` table has no `thread_id` column at all, and `CREATE TABLE IF NOT EXISTS`
+cannot reshape a table that already exists — so ingest failed outright with "no
+column named thread_id" until `store::connect(true)` learned to check
+`table_info(turn)` and `ALTER TABLE turn ADD COLUMN thread_id` when it is
+missing. That migration restores ingest and nothing more: SQLite cannot alter a
+PRIMARY KEY, so such a database keeps `PRIMARY KEY (id)` and goes on collapsing
+the ~6 cross-thread Codex collisions, exactly as before. Only a database created
+fresh after the fix gets the composite key and stores all 6. Closing the gap on
+an existing store means rebuilding the table and re-ingesting — data traded for
+correctness, so it is an operator decision, not something a connect path should
+do on its own.
+
 ## Known complications
 
 - **pid liveness shells out** to `claude agents --json --all` in any language.

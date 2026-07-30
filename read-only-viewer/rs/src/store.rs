@@ -16,6 +16,7 @@
 //! transcript, agent state, or anything an agent reads back.
 
 use std::path::PathBuf;
+use std::time::Duration;
 
 use rusqlite::{params, Connection, OpenFlags};
 use serde_json::{json, Value};
@@ -107,6 +108,25 @@ CREATE TABLE IF NOT EXISTS observation (
 );
 "#;
 
+/// How long either connection waits on a locked database before giving up.
+///
+/// A reader that lands mid-write must wait, not fail: ingest holds the write
+/// lock for a fraction of a second, and `/api/activity` reporting "store
+/// unavailable" because that fraction overlapped a poll is a lie about the
+/// store.
+///
+/// **This is a pin, not a fix.** rusqlite already calls
+/// `sqlite3_busy_timeout(db, 5000)` inside every `open` (0.40.1,
+/// `inner_connection.rs`), so today's behaviour is unchanged — measured against a
+/// 3 s exclusive lock, `/api/activity` waits 2.96 s and then serves real rows
+/// both with and without this line. It is set here so the 5 s is ours rather
+/// than a dependency's default, and the same measurement at 0 ms shows what that
+/// default is holding up: the read open fails immediately and `/api/activity`
+/// answers in 7 ms with empty rows and `"unavailable": "database is locked"` —
+/// an HTTP 200 that reads as "no activity", which is the failure mode this file
+/// already refuses elsewhere. Ingest fails outright the same way.
+const BUSY_TIMEOUT: Duration = Duration::from_millis(5000);
+
 #[derive(Debug)]
 pub struct Unavailable(pub String);
 
@@ -141,6 +161,7 @@ pub fn connect(write: bool) -> Result<Connection, Unavailable> {
             let _ = std::fs::create_dir_all(parent);
         }
         let conn = Connection::open(&target).map_err(|e| Unavailable(e.to_string()))?;
+        conn.busy_timeout(BUSY_TIMEOUT).map_err(|e| Unavailable(e.to_string()))?;
         // NOTE: SQL below uses raw strings, never backslash line-continuation.
         // Rust's `\` strips the newline AND the next line's leading whitespace, so
         // "DO UPDATE SET\\n  last_seen" becomes "SETlast_seen" — invalid SQL that
@@ -163,15 +184,55 @@ pub fn connect(write: bool) -> Result<Connection, Unavailable> {
             );
         }
         conn.execute_batch(SCHEMA).map_err(|e| Unavailable(e.to_string()))?;
+        migrate_turn_thread_id(&conn)?;
         return Ok(conn);
     }
     if !target.exists() {
         return Err(Unavailable(format!("no store at {}", target.display())));
     }
     // Read-only, and a reader can never create the file by accident.
-    Connection::open_with_flags(&target, OpenFlags::SQLITE_OPEN_READ_ONLY)
+    let conn = Connection::open_with_flags(&target, OpenFlags::SQLITE_OPEN_READ_ONLY)
         .map_err(|e| Unavailable(format!("{e} (if the store predates the rollback-journal \
-                                          change, one `--ingest-only` converts it)")))
+                                          change, one `--ingest-only` converts it)")))?;
+    conn.busy_timeout(BUSY_TIMEOUT).map_err(|e| Unavailable(e.to_string()))?;
+    Ok(conn)
+}
+
+/// Add `turn.thread_id` to a store created before the column existed.
+///
+/// `CREATE TABLE IF NOT EXISTS` does nothing to a table that is already there,
+/// so a store written by an older build keeps its original `turn` shape and
+/// every snapshot ingest against it fails outright with "no column named
+/// thread_id". The column has to be added explicitly.
+///
+/// Idempotent by construction: a second connect sees the column and returns
+/// without touching anything.
+///
+/// This deliberately does NOT restore the composite key. SQLite cannot alter a
+/// PRIMARY KEY, so a migrated store keeps `PRIMARY KEY (id)` and goes on
+/// collapsing the ~6 cross-thread Codex collisions the composite key exists to
+/// keep. Recovering them means rebuilding the table and re-ingesting, which
+/// trades data for correctness and is an operator decision — see
+/// `read-only-viewer/PORT.md`. Ingest working again is the point here.
+fn migrate_turn_thread_id(conn: &Connection) -> Result<(), Unavailable> {
+    let mut stmt = conn
+        .prepare("PRAGMA table_info(turn)")
+        .map_err(|e| Unavailable(format!("turn table_info: {e}")))?;
+    let cols = stmt
+        .query_map([], |r| r.get::<_, String>(1))
+        .map_err(|e| Unavailable(format!("turn table_info: {e}")))?
+        .collect::<Result<Vec<String>, _>>()
+        .map_err(|e| Unavailable(format!("turn table_info: {e}")))?;
+    if cols.iter().any(|c| c == "thread_id") {
+        return Ok(());
+    }
+    conn.execute_batch(r#"ALTER TABLE turn ADD COLUMN thread_id TEXT NOT NULL DEFAULT ''"#)
+        .map_err(|e| Unavailable(format!("turn thread_id migration: {e}")))?;
+    eprintln!(
+        "store: migrated `turn` — added thread_id. This db predates the (id, thread_id) \
+         key, so its PRIMARY KEY stays (id); see PORT.md."
+    );
+    Ok(())
 }
 
 #[derive(Default, Debug)]
