@@ -21,6 +21,7 @@ mod model;
 mod par;
 mod process;
 mod spill;
+mod spool;
 mod store;
 mod transcripts;
 mod web;
@@ -191,17 +192,63 @@ fn ingest_once() -> i32 {
         }
     };
     println!("store: {}", store::db_path().display());
-    match store::ingest(&mut conn, &snapshot) {
+
+    // The spool is a second, independent input: hooks record tool calls, which
+    // no transcript reliably carries.
+    let spooled = spool::read_all();
+    match spooled.files {
+        // "The hooks have not run" is a fact, not a failure — but it is also not
+        // "there were no tool calls", so say which one it is.
+        None => println!("spool: {} (absent)", spooled.dir.display()),
+        Some(n) => println!(
+            "spool: {} ({n} file{}, {} events, {} skipped)",
+            spooled.dir.display(),
+            if n == 1 { "" } else { "s" },
+            spooled.calls.len(),
+            spooled.skipped
+        ),
+    }
+    for err in &spooled.errors {
+        eprintln!("spool: could not read {err}");
+    }
+
+    // Two independent inputs, so they get two independent attempts: a snapshot
+    // that will not ingest must not silently take the spool down with it. Found
+    // the hard way — the live store predates `turn`'s (id, thread_id) key, so its
+    // snapshot ingest fails outright, and a nested attempt would have discarded
+    // every tool call for a reason that has nothing to do with the spool.
+    let snapshot_result = store::ingest(&mut conn, &snapshot);
+    let tool_result = store::ingest_tool_calls(&mut conn, &spooled.calls);
+
+    let mut status = 0;
+    let tool_call_new = match &tool_result {
+        Ok(n) => n.to_string(),
+        Err(e) => {
+            eprintln!("tool_call ingest failed: {e}");
+            status = 1;
+            // Never "0": that reads as "there was nothing to write".
+            "failed".to_string()
+        }
+    };
+    match &snapshot_result {
         Ok(c) => println!(
             "  changed:  turn_new={}, selection_new={}, compaction_new={}, \
-observation_new={}, session_seen={}, subagent_seen={}",
+observation_new={}, session_seen={}, subagent_seen={}, tool_call_new={}, \
+spool_skipped={}",
             c.turn_new, c.selection_new, c.compaction_new, c.observation_new,
-            c.session_seen, c.subagent_seen
+            c.session_seen, c.subagent_seen, tool_call_new, spooled.skipped
         ),
         Err(e) => {
             eprintln!("ingest failed: {e}");
-            return 1;
+            status = 1;
+            println!(
+                "  changed:  snapshot ingest FAILED, tool_call_new={}, spool_skipped={}",
+                tool_call_new, spooled.skipped
+            );
         }
+    }
+    if status != 0 {
+        return status;
     }
     if let Ok(t) = store::totals(&conn) {
         println!(
