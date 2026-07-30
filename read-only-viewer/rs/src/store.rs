@@ -71,6 +71,34 @@ CREATE TABLE IF NOT EXISTS subagent (
   role TEXT, status TEXT, first_seen TEXT, last_seen TEXT
 );
 
+-- Tool calls, from the hook spool rather than a transcript. Harness-neutral:
+-- one row per spooled EVENT, mirroring the frozen line contract in spool.rs.
+--
+-- `id` is the spool line's own identity (see ToolCall::id): the harness's
+-- tool_use_id qualified by the event, or a hash of the observation when there is
+-- no tool_use_id. It is stable across runs and across rebuilds, which is what
+-- makes re-reading a spool file free.
+--
+-- `tool_use_id` stays its own column even though it is inside `id`. It is the
+-- only thing that pairs a `pre` with its `post`, and a later view wants that
+-- pairing to be a join rather than string surgery on the key.
+CREATE TABLE IF NOT EXISTS tool_call (
+  id          TEXT PRIMARY KEY,
+  harness     TEXT NOT NULL,
+  session_id  TEXT NOT NULL,
+  ts          TEXT,
+  event       TEXT NOT NULL,
+  tool        TEXT NOT NULL,
+  cwd         TEXT,
+  target      TEXT,
+  arg         TEXT,
+  ok          INTEGER,
+  tool_use_id TEXT
+);
+CREATE INDEX IF NOT EXISTS tool_call_session_ts ON tool_call(session_id, ts);
+CREATE INDEX IF NOT EXISTS tool_call_ts         ON tool_call(ts);
+CREATE INDEX IF NOT EXISTS tool_call_use_id     ON tool_call(tool_use_id);
+
 -- Process state cannot be recovered later: a transcript never records that a
 -- session was alive at 3am. So it is sampled, not derived.
 CREATE TABLE IF NOT EXISTS observation (
@@ -342,6 +370,48 @@ pub fn ingest(conn: &mut Connection, snapshot: &Value) -> Result<Counts, Unavail
     }
     tx.commit().map_err(|e| Unavailable(e.to_string()))?;
     Ok(counts)
+}
+
+/// Write spooled tool calls. Returns rows genuinely NEW.
+///
+/// `INSERT OR IGNORE` on the line's own id, like every other immutable fact
+/// here: a spool file re-read (a poll, a crash, a day's file read twice) costs
+/// nothing and changes nothing.
+pub fn ingest_tool_calls(
+    conn: &mut Connection,
+    calls: &[crate::spool::ToolCall],
+) -> Result<i64, Unavailable> {
+    let tx = conn.transaction().map_err(|e| Unavailable(e.to_string()))?;
+    let before = tx.total_changes() as i64;
+    {
+        let mut stmt = tx
+            .prepare(
+                r#"INSERT OR IGNORE INTO tool_call
+                     (id, harness, session_id, ts, event, tool, cwd, target, arg,
+                      ok, tool_use_id)
+                   VALUES (?,?,?,?,?,?,?,?,?,?,?)"#,
+            )
+            .map_err(|e| Unavailable(e.to_string()))?;
+        for call in calls {
+            stmt.execute(params![
+                call.id(),
+                call.harness,
+                call.session_id,
+                call.ts,
+                call.event,
+                call.tool,
+                call.cwd,
+                call.target,
+                call.arg,
+                call.ok,
+                call.tool_use_id,
+            ])
+            .map_err(|e| Unavailable(format!("tool_call insert: {e}")))?;
+        }
+    }
+    let new = tx.total_changes() as i64 - before;
+    tx.commit().map_err(|e| Unavailable(e.to_string()))?;
+    Ok(new)
 }
 
 /// Turns and output tokens per day per harness — the activity chart.
