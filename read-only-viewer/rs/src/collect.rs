@@ -186,7 +186,7 @@ impl Collector {
             } else {
                 "ended"
             };
-            let subs: Vec<Value> = s
+            let mut subs: Vec<Value> = s
                 .subagents
                 .iter()
                 .map(|a| {
@@ -225,6 +225,15 @@ impl Collector {
                     })
                 })
                 .collect();
+            // Running subagents first, then freshest (Python's live_first,
+            // claude.py:207). The Codex source sorts before collect because it
+            // owns age/live; for Claude both are only known here.
+            subs.sort_by(|a, b| {
+                let key = |v: &Value| {
+                    (!v["live"].as_bool().unwrap_or(false), v["age_s"].as_f64().unwrap_or(1e18))
+                };
+                key(a).partial_cmp(&key(b)).unwrap_or(std::cmp::Ordering::Equal)
+            });
             out.push(json!({
                 "harness": "claude", "session_id": s.session_id, "label": s.label,
                 "project": s.project, "cwd": s.cwd, "branch": s.branch,
