@@ -14,8 +14,8 @@ use regex::Regex;
 use serde_json::Value;
 
 use crate::model::{
-    event_text, is_real_model, push_model, push_selection, Compaction, ModelAt, Selection,
-    TurnRow, Usage,
+    event_effort, event_text, is_real_model, push_effort, push_model, push_selection,
+    push_version, Compaction, EffortAt, ModelAt, Selection, TurnRow, Usage, VersionAt,
 };
 use crate::cache::ScanCache;
 use crate::transcripts::{chronological, file_size, tail_events};
@@ -33,6 +33,9 @@ pub struct Scan {
     pub cwd: String,
     pub branch: String,
     pub effort: String,
+    pub effort_timeline: Vec<EffortAt>,
+    pub version: String,
+    pub version_timeline: Vec<VersionAt>,
     pub compactions: Vec<Compaction>,
     pub usage_since_compact: Option<Usage>,
     pub turns_since_compact: Option<i64>,
@@ -40,6 +43,10 @@ pub struct Scan {
 
 pub struct SubAgent {
     pub turn_rows: Vec<TurnRow>,
+    pub effort: String,
+    pub effort_timeline: Vec<EffortAt>,
+    pub version: String,
+    pub version_timeline: Vec<VersionAt>,
     pub id: String,
     pub label: String,
     pub model: String,
@@ -65,6 +72,9 @@ pub struct Session {
     pub cwd: String,
     pub branch: String,
     pub effort: String,
+    pub effort_timeline: Vec<EffortAt>,
+    pub version: String,
+    pub version_timeline: Vec<VersionAt>,
     pub model: String,
     pub selected_model: String,
     pub selections: Vec<Selection>,
@@ -107,7 +117,12 @@ impl Res {
 pub fn scan(path: &Path, main_thread_only: bool) -> Scan {
     let res = Res::new();
     let mut timeline: Vec<ModelAt> = Vec::new();
+    let mut effort_timeline: Vec<EffortAt> = Vec::new();
+    let mut version_timeline: Vec<VersionAt> = Vec::new();
     let mut turn_rows: Vec<TurnRow> = Vec::new();
+    // message.id -> the row it produced, so the thinking blocks spread across a
+    // turn's several events land on ONE row rather than on several.
+    let mut row_of_msg: HashMap<String, usize> = HashMap::new();
     let mut selections: Vec<Selection> = Vec::new();
     let mut pending_args = String::new();
     let mut usage = Usage::default();
@@ -117,6 +132,7 @@ pub fn scan(path: &Path, main_thread_only: bool) -> Scan {
     let mut compactions: Vec<Compaction> = Vec::new();
     let (mut last_ts, mut cwd, mut branch, mut effort) =
         (String::new(), String::new(), String::new(), String::new());
+    let mut version = String::new();
 
     for event in chronological(tail_events(path), "timestamp") {
         if cwd.is_empty() {
@@ -182,12 +198,36 @@ pub fn scan(path: &Path, main_thread_only: bool) -> Scan {
         if !ts.is_empty() {
             last_ts = ts.clone();
         }
-        if let Some(level) = event.get("effort").and_then(|e| e.get("level")).and_then(Value::as_str)
-        {
-            if !level.is_empty() {
-                effort = level.to_string();
-            }
+        // Per EVENT, which is what makes the per-turn trace possible at all: this
+        // is not a session setting read once, it is stamped on every assistant
+        // event the harness writes.
+        let at_effort = event_effort(&event);
+        if !at_effort.is_empty() {
+            effort = at_effort.clone();
         }
+        // The CLI build that served this event. Top-level, on every line the
+        // harness writes, and it MOVES: a session left open across upgrades
+        // records each one in place, so this is a per-turn fact rather than a
+        // session header.
+        let at_version =
+            event.get("version").and_then(Value::as_str).unwrap_or("").to_string();
+        if !at_version.is_empty() {
+            version = at_version.clone();
+        }
+        // Thinking blocks carry a signature and no text (0 of 22,669 measured),
+        // so the honest signal is that the model thought and how many times —
+        // never a body. Counted per EVENT and summed onto the turn's row below,
+        // because one turn is written as several events.
+        let thinking = message
+            .get("content")
+            .and_then(Value::as_array)
+            .map(|blocks| {
+                blocks
+                    .iter()
+                    .filter(|b| b.get("type").and_then(Value::as_str) == Some("thinking"))
+                    .count() as i64
+            })
+            .unwrap_or(0);
 
         // One logical turn writes SEVERAL assistant events (one per content
         // block), each repeating the same message.id AND the same usage dict.
@@ -214,6 +254,9 @@ pub fn scan(path: &Path, main_thread_only: bool) -> Scan {
             // no-op; with no id, file+timestamp is still stable across scans.
             let u = message.get("usage");
             let g = |k: &str| u.and_then(|x| x.get(k)).and_then(Value::as_i64).unwrap_or(0);
+            if !msg_id.is_empty() {
+                row_of_msg.insert(msg_id.clone(), turn_rows.len());
+            }
             turn_rows.push(TurnRow {
                 id: if msg_id.is_empty() {
                     format!("{}:{}", path.file_name().unwrap_or_default().to_string_lossy(), ts)
@@ -226,9 +269,22 @@ pub fn scan(path: &Path, main_thread_only: bool) -> Scan {
                 output: Some(g("output_tokens")),
                 cache_read: Some(g("cache_read_input_tokens")),
                 cache_write: Some(g("cache_creation_input_tokens")),
+                effort: at_effort.clone(),
+                version: at_version.clone(),
+                // Countable on every Claude event, so Some(0) is a fact: this
+                // turn thought nothing. Codex has no blocks to count at all.
+                thinking_blocks: Some(thinking),
+                reasoning_tokens: None,
             });
+        } else if let Some(&at) = row_of_msg.get(&msg_id) {
+            // A later event of the SAME turn. Its blocks belong to the row the
+            // first event opened.
+            let prior = turn_rows[at].thinking_blocks.unwrap_or(0);
+            turn_rows[at].thinking_blocks = Some(prior + thinking);
         }
         push_model(&mut timeline, model, &ts);
+        push_effort(&mut effort_timeline, &at_effort, &ts);
+        push_version(&mut version_timeline, &at_version, &ts);
     }
 
     let model = timeline.last().map(|t| t.model.clone()).unwrap_or_default();
@@ -246,6 +302,9 @@ pub fn scan(path: &Path, main_thread_only: bool) -> Scan {
         cwd,
         branch,
         effort,
+        effort_timeline,
+        version,
+        version_timeline,
         compactions,
         usage_since_compact: if has_compactions { Some(ctx_usage) } else { None },
         turns_since_compact: if has_compactions { Some(ctx_turns) } else { None },
@@ -348,6 +407,12 @@ pub fn collect(root: &Path, cache: &ScanCache<Scan>) -> Vec<Session> {
                     let record = records.get(&agent_id);
                     subs.push(SubAgent {
                         turn_rows: child_info.turn_rows.clone(),
+                        // A child transcript is a full transcript, so the effort
+                        // trace comes out of the same scan with no extra work.
+                        effort: child_info.effort.clone(),
+                        effort_timeline: child_info.effort_timeline.clone(),
+                        version: child_info.version.clone(),
+                        version_timeline: child_info.version_timeline.clone(),
                         label: agent_id.chars().take(12).collect(),
                         // Child transcript wins: written from the first event, so
                         // a running subagent reports its model before any record.
@@ -377,6 +442,11 @@ pub fn collect(root: &Path, cache: &ScanCache<Scan>) -> Vec<Session> {
             for (agent_id, record) in orphans {
                 subs.push(SubAgent {
                     turn_rows: Vec::new(),
+                    // No transcript, so nothing observed the effort. Not "".
+                    effort: String::new(),
+                    effort_timeline: Vec::new(),
+                    version: String::new(),
+                    version_timeline: Vec::new(),
                     id: agent_id.clone(),
                     label: agent_id.chars().take(12).collect(),
                     model: record.resolved_model.clone(),
@@ -400,6 +470,9 @@ pub fn collect(root: &Path, cache: &ScanCache<Scan>) -> Vec<Session> {
                 cwd: info.cwd,
                 branch: info.branch,
                 effort: info.effort,
+                effort_timeline: info.effort_timeline,
+                version: info.version,
+                version_timeline: info.version_timeline,
                 model: info.model,
                 selected_model: info.selected_model,
                 selections: info.selections,

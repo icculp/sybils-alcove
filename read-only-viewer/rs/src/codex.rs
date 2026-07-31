@@ -10,7 +10,9 @@ use std::path::{Path, PathBuf};
 
 use serde_json::Value;
 
-use crate::model::{is_real_model, push_model, Compaction, ModelAt, TurnRow, Usage};
+use crate::model::{
+    is_real_model, push_effort, push_model, Compaction, EffortAt, ModelAt, TurnRow, Usage,
+};
 use crate::cache::ScanCache;
 use crate::transcripts::{chronological, file_size, head_events, tail_events};
 
@@ -28,6 +30,11 @@ pub struct Scan {
     pub last_ts: String,
     pub cwd: String,
     pub effort: String,
+    pub effort_timeline: Vec<EffortAt>,
+    /// `session_meta.cli_version` — the build that WROTE this rollout. See the
+    /// note on `TurnRow::version`: Codex records no per-turn version, so this is
+    /// a session fact and never a turn one.
+    pub version: String,
     pub compactions: Vec<Compaction>,
     pub usage_since_compact: Option<Usage>,
     pub turns_since_compact: Option<i64>,
@@ -43,6 +50,9 @@ pub struct SubAgent {
     pub status: String,
     pub nickname: String,
     pub turn_rows: Vec<TurnRow>,
+    pub effort: String,
+    pub effort_timeline: Vec<EffortAt>,
+    pub version: String,
     pub age_s: Option<f64>,
     pub live: bool,
     pub size: u64,
@@ -64,6 +74,8 @@ pub struct Session {
     pub project: String,
     pub cwd: String,
     pub effort: String,
+    pub effort_timeline: Vec<EffortAt>,
+    pub version: String,
     pub model: String,
     pub timeline: Vec<ModelAt>,
     pub usage: Usage,
@@ -76,13 +88,20 @@ pub struct Session {
 
 pub fn scan(path: &Path) -> Scan {
     let mut timeline: Vec<ModelAt> = Vec::new();
+    let mut effort_timeline: Vec<EffortAt> = Vec::new();
     let mut turn_rows: Vec<TurnRow> = Vec::new();
+    // Reasoning tokens accrue across a turn's several model round-trips and are
+    // reported AFTER the assistant message, so they are bucketed between
+    // `turn_context` boundaries and attached when the bucket closes. `None`
+    // until a `last_token_usage` is actually seen: absent is not zero.
+    let (mut bucket_reasoning, mut bucket_start) = (Option::<i64>::None, 0usize);
     let mut usage = Usage::default();
     let (mut turns, mut ctx_turns) = (0i64, 0i64);
     let mut compactions: Vec<Compaction> = Vec::new();
     let mut usage_at_compact: Option<Usage> = None;
     let (mut last_ts, mut cwd, mut effort) = (String::new(), String::new(), String::new());
     let (mut role, mut nickname) = (String::new(), String::new());
+    let mut version = String::new();
     let (mut sid, mut parent) = (String::new(), String::new());
 
     // Identity from the head (line 1), activity from the tail. `payload.id` is
@@ -101,6 +120,11 @@ pub fn scan(path: &Path) -> Scan {
             if id.is_empty() { s("session_id") } else { id }
         };
         cwd = s("cwd");
+        // The only version Codex writes down. `turn_context` carries
+        // `multi_agent_version: "v1"` and nothing else version-shaped (678/678
+        // lines measured across July) — a feature-schema marker, not a build, so
+        // it is deliberately not read as one.
+        version = s("cli_version");
         role = s("agent_role");
         nickname = s("agent_nickname");
         parent = s("parent_thread_id");
@@ -154,15 +178,37 @@ pub fn scan(path: &Path) -> Scan {
         };
 
         if kind == "turn_context" {
-            // Written once per SESSION (and again on a model or effort change),
-            // NOT once per turn. Counting it reported every Codex session and
-            // subagent as having taken exactly one.
+            // NOT the turn signal, whatever the name says — counting it reported
+            // every Codex session and subagent as having taken exactly one turn.
+            // It is a turn BOUNDARY: written before a turn runs and again on a
+            // model or effort change (153 of them against 126 `task_started` in
+            // one measured rollout), which is what makes it the right place to
+            // close a reasoning bucket and the wrong place to take a time from.
+            //
+            // **Its timestamp is not trustworthy.** On resume Codex replays the
+            // whole history into the new rollout and restamps every replayed line
+            // with the file-open time: in
+            // `rollout-2026-07-31T01-26-37-019fb5c7…` 147 of 153 turn_context
+            // lines share three seconds at the head of the file. Order survives
+            // that; chronology does not. So the effort switch is recorded at the
+            // timestamp of the TURN it governed, taken from the assistant message
+            // below, and never from here.
             let model = payload.get("model").and_then(Value::as_str);
             if let Some(e) = payload.get("effort").and_then(Value::as_str) {
                 if !e.is_empty() {
                     effort = e.to_string();
                 }
             }
+            // Close the previous turn's reasoning bucket onto the row it belongs
+            // to. The trailing `token_count` lands after the assistant message,
+            // so attaching on arrival would push it onto the following turn.
+            if let (Some(n), true) = (bucket_reasoning, turn_rows.len() > bucket_start) {
+                if let Some(row) = turn_rows.last_mut() {
+                    row.reasoning_tokens = Some(n);
+                }
+            }
+            bucket_reasoning = None;
+            bucket_start = turn_rows.len();
             if is_real_model(model) {
                 if !ts.is_empty() && last_ts.is_empty() {
                     last_ts = ts.clone();
@@ -194,11 +240,30 @@ pub fn scan(path: &Path) -> Scan {
                 output: None,
                 cache_read: None,
                 cache_write: None,
+                // The effort the preceding `turn_context` set, stamped on the
+                // turn it actually governed.
+                effort: effort.clone(),
+                // Not the rollout's cli_version: a resumed rollout replays turns
+                // that an older build served. See TurnRow::version.
+                version: String::new(),
+                // Codex writes no thinking blocks to count.
+                thinking_blocks: None,
+                // Filled when the bucket closes; see the `turn_context` arm.
+                reasoning_tokens: None,
             });
+            push_effort(&mut effort_timeline, &effort, &ts);
         } else if kind == "event_msg" && ptype == "token_count" {
             let Some(info) = payload.get("info").filter(|i| i.is_object()) else {
                 continue;
             };
+            // Per-request, unlike `total_token_usage` next to it — the one
+            // per-turn "how much did it think" number Codex records, and the
+            // analogue of Claude's thinking-block count.
+            if let Some(last) = info.get("last_token_usage").filter(|t| t.is_object()) {
+                if let Some(r) = last.get("reasoning_output_tokens").and_then(Value::as_i64) {
+                    bucket_reasoning = Some(bucket_reasoning.unwrap_or(0) + r);
+                }
+            }
             if let Some(total) = info.get("total_token_usage").filter(|t| t.is_object()) {
                 let g = |k: &str| total.get(k).and_then(Value::as_i64).unwrap_or(0);
                 // Cumulative snapshot: REPLACE, never accumulate.
@@ -210,6 +275,13 @@ pub fn scan(path: &Path) -> Scan {
                     reasoning: g("reasoning_output_tokens"),
                 };
             }
+        }
+    }
+
+    // The last bucket has no closing `turn_context`; close it at end of file.
+    if let (Some(n), true) = (bucket_reasoning, turn_rows.len() > bucket_start) {
+        if let Some(row) = turn_rows.last_mut() {
+            row.reasoning_tokens = Some(n);
         }
     }
 
@@ -235,6 +307,8 @@ pub fn scan(path: &Path) -> Scan {
         last_ts,
         cwd,
         effort,
+        effort_timeline,
+        version,
         compactions,
         usage_since_compact: since,
         turns_since_compact: if has_compactions { Some(ctx_turns) } else { None },
@@ -330,6 +404,11 @@ pub fn collect(root: &Path, cache: &ScanCache<Scan>) -> Vec<Session> {
                         prior.timeline.push(m.clone());
                     }
                 }
+                for e in &info.effort_timeline {
+                    if prior.effort_timeline.last().map(|t| &t.effort) != Some(&e.effort) {
+                        prior.effort_timeline.push(e.clone());
+                    }
+                }
                 if info.usage.output >= prior.usage.output {
                     prior.usage = info.usage;
                 }
@@ -347,6 +426,9 @@ pub fn collect(root: &Path, cache: &ScanCache<Scan>) -> Vec<Session> {
                 }
                 if !info.effort.is_empty() {
                     prior.effort = info.effort.clone();
+                }
+                if !info.version.is_empty() {
+                    prior.version = info.version.clone();
                 }
                 if !info.cwd.is_empty() {
                     prior.cwd = info.cwd.clone();
@@ -414,6 +496,11 @@ pub fn collect(root: &Path, cache: &ScanCache<Scan>) -> Vec<Session> {
                 status: child.spawn_status.clone(),
                 nickname: child.nickname.clone(),
                 turn_rows: child.turn_rows.clone(),
+                // A Codex subagent writes its own full rollout, so its effort
+                // trace comes out of the same scan the parent's does.
+                effort: child.effort.clone(),
+                effort_timeline: child.effort_timeline.clone(),
+                version: child.version.clone(),
                 age_s: child.age_s,
                 live: child.live,
                 size: child.size,
@@ -450,6 +537,8 @@ pub fn collect(root: &Path, cache: &ScanCache<Scan>) -> Vec<Session> {
                 .unwrap_or_else(|| "unknown".to_string()),
             cwd: info.cwd.clone(),
             effort: info.effort.clone(),
+            effort_timeline: info.effort_timeline.clone(),
+            version: info.version.clone(),
             model: info.model.clone(),
             timeline: info.timeline.clone(),
             usage: info.usage,
