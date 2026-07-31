@@ -42,6 +42,15 @@ CREATE TABLE IF NOT EXISTS turn (
   cache_read  INTEGER,
   cache_write INTEGER,
   is_subagent INTEGER NOT NULL DEFAULT 0,
+  -- The reasoning effort the turn was served at, and the harness build that
+  -- served it. '' means the transcript did not record one — most of the corpus
+  -- predates both fields — and is NOT a stand-in for a lowest setting or an
+  -- oldest release. `version` is always '' for Codex: it writes a version only
+  -- in `session_meta`, and a resumed rollout replays turns an older build
+  -- served, so a per-turn value there would be invented. The reference
+  -- implementation is frozen and writes NEITHER column; see PORT.md.
+  effort      TEXT NOT NULL DEFAULT '',
+  version     TEXT NOT NULL DEFAULT '',
   PRIMARY KEY (id, thread_id)
 );
 CREATE INDEX IF NOT EXISTS turn_session_ts ON turn(session_id, ts);
@@ -185,6 +194,7 @@ pub fn connect(write: bool) -> Result<Connection, Unavailable> {
         }
         conn.execute_batch(SCHEMA).map_err(|e| Unavailable(e.to_string()))?;
         migrate_turn_thread_id(&conn)?;
+        migrate_turn_facts(&conn)?;
         return Ok(conn);
     }
     if !target.exists() {
@@ -214,7 +224,7 @@ pub fn connect(write: bool) -> Result<Connection, Unavailable> {
 /// keep. Recovering them means rebuilding the table and re-ingesting, which
 /// trades data for correctness and is an operator decision — see
 /// `read-only-viewer/PORT.md`. Ingest working again is the point here.
-fn migrate_turn_thread_id(conn: &Connection) -> Result<(), Unavailable> {
+fn turn_columns(conn: &Connection) -> Result<Vec<String>, Unavailable> {
     let mut stmt = conn
         .prepare("PRAGMA table_info(turn)")
         .map_err(|e| Unavailable(format!("turn table_info: {e}")))?;
@@ -223,6 +233,11 @@ fn migrate_turn_thread_id(conn: &Connection) -> Result<(), Unavailable> {
         .map_err(|e| Unavailable(format!("turn table_info: {e}")))?
         .collect::<Result<Vec<String>, _>>()
         .map_err(|e| Unavailable(format!("turn table_info: {e}")))?;
+    Ok(cols)
+}
+
+fn migrate_turn_thread_id(conn: &Connection) -> Result<(), Unavailable> {
+    let cols = turn_columns(conn)?;
     if cols.iter().any(|c| c == "thread_id") {
         return Ok(());
     }
@@ -231,6 +246,44 @@ fn migrate_turn_thread_id(conn: &Connection) -> Result<(), Unavailable> {
     eprintln!(
         "store: migrated `turn` — added thread_id. This db predates the (id, thread_id) \
          key, so its PRIMARY KEY stays (id); see PORT.md."
+    );
+    Ok(())
+}
+
+/// Add the per-turn provenance columns — `effort` and `version` — to a store
+/// created before they existed.
+///
+/// Same guarded shape as the `thread_id` migration above and for the same
+/// reason: `CREATE TABLE IF NOT EXISTS` cannot reshape an existing table, so
+/// without this every ingest against an older store fails with "no column named
+/// effort". ONE `table_info` read covers both, and one line is printed however
+/// many columns it had to add — two migrations for one release would print
+/// twice and read as two separate problems.
+///
+/// Unlike `thread_id` this loses nothing. Neither column is part of the key,
+/// the default is the same '' the scanners write when a transcript records
+/// nothing, and rows ingested before the columns existed simply say "not
+/// recorded" — which is the truth about them.
+fn migrate_turn_facts(conn: &Connection) -> Result<(), Unavailable> {
+    let cols = turn_columns(conn)?;
+    let mut added: Vec<&str> = Vec::new();
+    for column in ["effort", "version"] {
+        if cols.iter().any(|c| c == column) {
+            continue;
+        }
+        conn.execute_batch(&format!(
+            r"ALTER TABLE turn ADD COLUMN {column} TEXT NOT NULL DEFAULT ''"
+        ))
+        .map_err(|e| Unavailable(format!("turn {column} migration: {e}")))?;
+        added.push(column);
+    }
+    if added.is_empty() {
+        return Ok(());
+    }
+    eprintln!(
+        "store: migrated `turn` — added {}. Rows written before this keep '' \
+         (not recorded), which is what they are.",
+        added.join(" and ")
     );
     Ok(())
 }
@@ -265,6 +318,11 @@ fn turn_params(
         row.get("cache_read").cloned().unwrap_or(Value::Null),
         row.get("cache_write").cloned().unwrap_or(Value::Null),
         json!(is_sub),
+        // NOT NULL DEFAULT '' in the schema, so a row from a scanner that saw no
+        // effort binds '' rather than NULL — one representation of "not
+        // recorded", not two.
+        row.get("effort").cloned().unwrap_or(json!("")),
+        row.get("version").cloned().unwrap_or(json!("")),
     ])
 }
 
@@ -303,8 +361,9 @@ pub fn ingest(conn: &mut Connection, snapshot: &Value) -> Result<Counts, Unavail
                 .prepare(
                     r#"INSERT OR IGNORE INTO turn
                          (id, thread_id, session_id, harness, ts, model, input,
-                          output, cache_read, cache_write, is_subagent)
-                       VALUES (?,?,?,?,?,?,?,?,?,?,?)"#,
+                          output, cache_read, cache_write, is_subagent, effort,
+                          version)
+                       VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)"#,
                 )
                 .map_err(|e| Unavailable(e.to_string()))?;
             for session in sessions {
