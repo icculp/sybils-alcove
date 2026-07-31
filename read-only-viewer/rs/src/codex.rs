@@ -5,7 +5,7 @@
 //! A Codex subagent writes a full sibling transcript with its own thread id; the
 //! link back is `parent_thread_id` in its `session_meta`.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
 use serde_json::Value;
@@ -84,6 +84,55 @@ pub struct Session {
     pub compactions: Vec<Compaction>,
     pub subagents: Vec<SubAgent>,
     pub path: PathBuf,
+}
+
+#[derive(Debug, Default, PartialEq)]
+struct ParentLink {
+    parent: String,
+    role: String,
+    nickname: String,
+    status: String,
+}
+
+fn parse_parent_link(raw: &str, child_id: &str) -> Option<ParentLink> {
+    let value: Value = serde_json::from_str(raw).ok()?;
+    if value.get("v").and_then(Value::as_i64) != Some(1)
+        || value.get("child_thread_id").and_then(Value::as_str) != Some(child_id)
+    {
+        return None;
+    }
+    let get = |key: &str| {
+        value.get(key).and_then(Value::as_str).unwrap_or("").to_string()
+    };
+    let link = ParentLink {
+        parent: get("parent_thread_id"),
+        role: get("agent_role"),
+        nickname: get("agent_nickname"),
+        status: get("status"),
+    };
+    (!link.parent.is_empty()).then_some(link)
+}
+
+fn apply_parent_link(info: &mut Scan) {
+    let path = info.path.with_extension("alcove-parent.json");
+    let Some(link) = std::fs::read_to_string(path)
+        .ok()
+        .and_then(|raw| parse_parent_link(&raw, &info.session_id))
+    else {
+        return;
+    };
+    if info.parent.is_empty() {
+        info.parent = link.parent;
+    }
+    if info.role.is_empty() {
+        info.role = link.role;
+    }
+    if info.nickname.is_empty() {
+        info.nickname = link.nickname;
+    }
+    if info.spawn_status.is_empty() {
+        info.spawn_status = link.status;
+    }
 }
 
 pub fn scan(path: &Path) -> Scan {
@@ -474,17 +523,23 @@ pub fn collect(root: &Path, cache: &ScanCache<Scan>) -> Vec<Session> {
         }
         info.spawn_status = edge.map(|e| e.status.clone()).unwrap_or_default();
         info.branch = meta.map(|m| m.branch.clone()).unwrap_or_default();
+        // The standalone Spark fallback has no native spawn edge. Its wrapper
+        // writes this adjacent sidecar after Codex closes the rollout. Native
+        // transcript and sqlite facts above remain authoritative.
+        apply_parent_link(info);
     }
 
+    let session_ids: HashSet<String> =
+        merged.iter().map(|info| info.session_id.clone()).collect();
     let mut children: HashMap<String, Vec<usize>> = HashMap::new();
     for (i, info) in merged.iter().enumerate() {
-        if !info.parent.is_empty() {
+        if !info.parent.is_empty() && session_ids.contains(&info.parent) {
             children.entry(info.parent.clone()).or_default().push(i);
         }
     }
 
     for (i, info) in merged.iter().enumerate() {
-        if !info.parent.is_empty() {
+        if !info.parent.is_empty() && session_ids.contains(&info.parent) {
             continue; // rendered under its parent
         }
         let mut subs: Vec<SubAgent> = Vec::new();
@@ -550,4 +605,29 @@ pub fn collect(root: &Path, cache: &ScanCache<Scan>) -> Vec<Session> {
         });
     }
     sessions
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{parse_parent_link, ParentLink};
+
+    #[test]
+    fn parses_matching_fallback_parent_link() {
+        let raw = r#"{"v":1,"child_thread_id":"child","parent_thread_id":"parent","agent_role":"spark-triage","agent_nickname":"Spark","status":"closed"}"#;
+        assert_eq!(
+            parse_parent_link(raw, "child"),
+            Some(ParentLink {
+                parent: "parent".into(),
+                role: "spark-triage".into(),
+                nickname: "Spark".into(),
+                status: "closed".into(),
+            })
+        );
+    }
+
+    #[test]
+    fn rejects_link_for_another_rollout() {
+        let raw = r#"{"v":1,"child_thread_id":"other","parent_thread_id":"parent"}"#;
+        assert_eq!(parse_parent_link(raw, "child"), None);
+    }
 }

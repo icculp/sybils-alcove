@@ -160,6 +160,7 @@ function STATE(s){
   if(s.status === 'completed' || s.status === 'closed')
     return '<span class="muted" title="from the parent\'s spawn record, not a '
       + 'stop event">done?</span>';
+  if(s.status === 'failed') return '<span class="warnx">failed</span>';
   if(s.status === 'open') return '<span class="muted" title="Codex still has '
     + 'this spawn open, but the transcript has been idle">open · idle</span>';
   return '<span class="muted" title="no stop event and no recent write; '
