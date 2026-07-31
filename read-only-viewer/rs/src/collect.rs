@@ -5,7 +5,7 @@
 //! it), and those come from different sources.
 
 use std::path::PathBuf;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use serde_json::{json, Value};
@@ -72,6 +72,66 @@ fn age_s(path: &PathBuf) -> Option<f64> {
 /// started before midnight still has its start on record next to its stop.
 const SPOOL_DAYS: i64 = 2;
 
+/// The pid map, and the one rule about refreshing it: never on the path that a
+/// browser is waiting on.
+///
+/// `claude agents --json --all` costs ~560 ms — more than every other part of a
+/// warm collect put together. Measured on the push path: an append reached the
+/// browser in 205 ms when the map was warm and **1,035 ms** when the TTL had just
+/// expired, because the collect stopped to run a subprocess. Same cadence, wrong
+/// thread.
+///
+/// So an expired map is SERVED while a refresh runs behind it: at most one
+/// lookup in flight, and the answer is at most one TTL plus one lookup old. The
+/// first call is still synchronous, because "no answer yet" would render as "no
+/// pids", which reads as "nothing is running" — the exact failure this codebase
+/// has already paid for once.
+#[derive(Default)]
+struct Procs {
+    inner: Mutex<Option<(Instant, std::collections::HashMap<String, process::Proc>, String)>>,
+    refreshing: std::sync::atomic::AtomicBool,
+}
+
+impl Procs {
+    fn store(&self, map: std::collections::HashMap<String, process::Proc>, status: String) {
+        if let Ok(mut guard) = self.inner.lock() {
+            *guard = Some((Instant::now(), map, status));
+        }
+    }
+
+    fn get(
+        self: &Arc<Self>,
+        ttl: Duration,
+    ) -> (std::collections::HashMap<String, process::Proc>, String) {
+        let cached = self.inner.lock().ok().and_then(|g| g.clone());
+        match cached {
+            Some((at, map, status)) => {
+                if at.elapsed() >= ttl
+                    && !self.refreshing.swap(true, std::sync::atomic::Ordering::SeqCst)
+                {
+                    let procs = Arc::clone(self);
+                    // Detached on purpose: nothing waits on this, and a lookup
+                    // that hangs must not hold a collect open behind it.
+                    let _ = std::thread::Builder::new()
+                        .name("alcove-pids".into())
+                        .spawn(move || {
+                            let (map, status) = process::running_pids();
+                            procs.store(map, status);
+                            procs.refreshing.store(false, std::sync::atomic::Ordering::SeqCst);
+                        });
+                }
+                (map, status)
+            }
+            // Cold: answer honestly, even though it costs the subprocess.
+            None => {
+                let (map, status) = process::running_pids();
+                self.store(map.clone(), status.clone());
+                (map, status)
+            }
+        }
+    }
+}
+
 pub struct Collector {
     claude_cache: ScanCache<claude::Scan>,
     codex_cache: ScanCache<codex::Scan>,
@@ -81,8 +141,9 @@ pub struct Collector {
     spool_cache: spool::SpoolCache,
     /// The pid lookup shells out to the `claude` CLI at ~560 ms. Once transcript
     /// scanning is cached that subprocess IS the refresh cost, so it gets its own
-    /// longer TTL rather than running on every poll.
-    procs: Mutex<Option<(Instant, std::collections::HashMap<String, process::Proc>, String)>>,
+    /// longer TTL rather than running on every poll — and, once a push path
+    /// exists, its own thread rather than the caller's.
+    procs: Arc<Procs>,
     /// (stored_at, value, how long the collect COST)
     snapshot: Mutex<Option<(Instant, Value, Duration)>>,
     /// Single-flight. Without it every waiting request starts its own collect:
@@ -106,7 +167,7 @@ impl Collector {
             claude_cache: ScanCache::default(),
             codex_cache: ScanCache::default(),
             spool_cache: spool::SpoolCache::default(),
-            procs: Mutex::new(None),
+            procs: Arc::default(),
             snapshot: Mutex::new(None),
             refresh: Mutex::new(()),
             paths: Mutex::new(std::collections::HashMap::new()),
@@ -115,19 +176,7 @@ impl Collector {
     }
 
     fn processes(&self) -> (std::collections::HashMap<String, process::Proc>, String) {
-        let ttl = Duration::from_secs_f64(self.cfg.pid_ttl_s);
-        if let Ok(guard) = self.procs.lock() {
-            if let Some((at, map, status)) = guard.as_ref() {
-                if at.elapsed() < ttl {
-                    return (map.clone(), status.clone());
-                }
-            }
-        }
-        let (map, status) = process::running_pids();
-        if let Ok(mut guard) = self.procs.lock() {
-            *guard = Some((Instant::now(), map.clone(), status.clone()));
-        }
-        (map, status)
+        self.procs.get(Duration::from_secs_f64(self.cfg.pid_ttl_s))
     }
 
     /// Serve the cache for at least as long as the last collect TOOK.
