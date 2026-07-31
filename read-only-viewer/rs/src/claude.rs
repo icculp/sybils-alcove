@@ -51,6 +51,10 @@ pub struct SubAgent {
     pub task: String,
     pub size: u64,
     pub no_transcript: bool,
+    /// The child transcript's own last event timestamp. Harness-written UTC, so
+    /// it is directly comparable with a spool `ts` — which mtime is not, and
+    /// which is the whole reason it is carried out of the scan.
+    pub last_ts: String,
 }
 
 pub struct Session {
@@ -360,6 +364,7 @@ pub fn collect(root: &Path, cache: &ScanCache<Scan>) -> Vec<Session> {
                         task: record.map(|r| r.task.clone()).unwrap_or_default(),
                         size: file_size(&child),
                         no_transcript: false,
+                        last_ts: child_info.last_ts.clone(),
                         id: agent_id,
                     });
                 }
@@ -383,6 +388,7 @@ pub fn collect(root: &Path, cache: &ScanCache<Scan>) -> Vec<Session> {
                     task: record.task.clone(),
                     size: 0,
                     no_transcript: true,
+                    last_ts: String::new(),
                 });
             }
 
