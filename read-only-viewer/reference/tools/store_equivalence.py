@@ -19,7 +19,7 @@ import sqlite3
 import sys
 
 # `turn` is checked separately: the two implementations DELIBERATELY differ there
-# after the freeze (see reference/README.md).
+# after the freeze (see reference/README.md and PORT.md).
 TABLES = {
     "selection": "select session_id,ts,model,requested from selection"
                  " order by session_id,ts,model",
@@ -30,8 +30,69 @@ TABLES = {
 }
 
 
+# The columns BOTH stores have. `effort` and `version` are Rust-only by decision
+# — the reference is frozen and does not learn them — so they can never appear in
+# a shared-column comparison, and `check_columns` below asserts that split
+# instead of letting it rot into an untested assumption.
 COLS = ("id,session_id,harness,ts,model,input,output,cache_read,cache_write,"
         "is_subagent")
+
+# Columns the Rust store has and the reference must NOT grow.
+RUST_ONLY = ("effort", "version")
+
+
+def turn_columns(conn: sqlite3.Connection) -> set[str]:
+    return {row[1] for row in conn.execute("pragma table_info(turn)")}
+
+
+def check_columns(py: sqlite3.Connection, rs: sqlite3.Connection) -> bool:
+    """The second documented divergence: per-turn effort and harness version.
+
+    The Rust scanners read a per-turn reasoning effort (both harnesses) and a
+    per-turn harness version (Claude only — Codex records one per rollout, and a
+    resumed rollout replays turns an older build served). The reference is
+    frozen and writes neither.
+
+    A shared-column diff would pass silently whether or not that stayed true, so
+    the shape is asserted directly: Rust HAS them, the reference does NOT, and
+    every column the two stores share is still compared byte for byte by
+    `check_turns`.
+    """
+    a, b = turn_columns(py), turn_columns(rs)
+    ok = True
+    for column in RUST_ONLY:
+        if column not in b:
+            print(f"     rust `turn` is MISSING {column} — the divergence is "
+                  f"documented in PORT.md but not implemented")
+            ok = False
+        if column in a:
+            print(f"     reference `turn` grew {column} — the reference is "
+                  f"frozen; either unfreeze it deliberately or revert")
+            ok = False
+    # Not just "the column exists" — prove the Rust reader actually fills it, and
+    # prove the frozen reference still cannot. A column that is present and
+    # always empty would satisfy a shape check and mean nothing.
+    filled = rs.execute(
+        "select count(*) from turn where effort <> '' or version <> ''"
+    ).fetchone()[0]
+    total = rs.execute("select count(*) from turn").fetchone()[0]
+    print(f"     rust populates {filled}/{total} turn rows with effort/version")
+    # `effort` is also excluded from the canonical snapshot for the same reason
+    # (canonical.py). If the reference is ever unfrozen and learns to read it,
+    # that exclusion becomes wrong — so notice it here.
+    if "effort" in a or "version" in a:
+        print("     the reference has been unfrozen; revisit canonical.py's "
+              "effort exclusion as well")
+    shared = a & b
+    missing = set(COLS.split(",")) - shared
+    if missing:
+        print("     columns compared by check_turns are not in both stores:",
+              sorted(missing))
+        ok = False
+    print(f"  turn cols   reference={len(a):5} rust={len(b):5}  "
+          f"rust-only={sorted(b - a)}  "
+          f"{'AS DOCUMENTED' if ok else 'UNDOCUMENTED'}")
+    return ok
 
 
 def check_turns(py: sqlite3.Connection, rs: sqlite3.Connection) -> bool:
@@ -71,7 +132,8 @@ def check_turns(py: sqlite3.Connection, rs: sqlite3.Connection) -> bool:
 
 def main(py_db: str, rs_db: str) -> int:
     py, rs = sqlite3.connect(py_db), sqlite3.connect(rs_db)
-    ok = check_turns(py, rs)
+    ok = check_columns(py, rs)
+    ok &= check_turns(py, rs)
     for label, sql in TABLES.items():
         a, b = py.execute(sql).fetchall(), rs.execute(sql).fetchall()
         same = a == b

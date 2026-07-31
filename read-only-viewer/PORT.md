@@ -87,7 +87,8 @@ hand.
 It exists to make replacement safe, and it is temporary. Two properties:
 
 - **cross-implementation** — Python and Rust produce byte-identical canonical
-  snapshots. Passing over 31 sessions.
+  snapshots. Passing over 31 sessions. `effort` is excluded by decision, not by
+  accident — see "Deliberate divergence" below.
 - **snapshot determinism** — repeated runs agree, so the parallel scan cannot
   reorder anything.
 - **store equivalence** — both implementations ingest identical rows into
@@ -157,6 +158,36 @@ fresh after the fix gets the composite key and stores all 6. Closing the gap on
 an existing store means rebuilding the table and re-ingesting — data traded for
 correctness, so it is an operator decision, not something a connect path should
 do on its own.
+
+## Deliberate divergence: `turn.effort` and `turn.version` are Rust-only
+
+The Rust scanners trace two per-turn facts the reference never learned, and the
+reference **stays frozen** — it does not grow these columns.
+
+- **`effort`** — both harnesses. Claude stamps it on every assistant event
+  (a bare string; the `{"level": …}` shape the first reader assumed appears zero
+  times in 19,783 events, which is why the session badge was blank). Codex writes
+  it on `turn_context`, whose timestamp is unusable after a resume, so the switch
+  is recorded at the timestamp of the turn it governed.
+- **`version`** — Claude only. Codex records a version once per rollout
+  (`session_meta.cli_version`) and a resumed rollout replays turns an older build
+  served, so a per-turn value there would be invented; `turn_context` carries only
+  `multi_agent_version: "v1"`, a feature marker rather than a build.
+
+Both default to `''`, which means "not recorded" and never "the lowest setting"
+or "the oldest release". `store_equivalence.py` asserts the SHAPE of this split
+(`check_columns`): the columns exist on the Rust side, are absent on the
+reference side, every shared column is still compared exactly, and it reports how
+many rows Rust actually filled — a column that existed and was always empty would
+pass a shape check and mean nothing.
+
+**The canonical snapshot no longer compares `effort` either.** The reference
+already had a session-level `effort` field and reads it as `{"level": …}`, a
+shape that occurs zero times in 19,783 real events, so it reports `""` for every
+session while Rust reports the real value. Leaving it in the byte diff would turn
+a documented one-way divergence into a permanent gate failure, which is how a
+gate stops being read. It is excluded in `canonical.py` and in Rust's
+`CanonSession`, and `check_columns` says so if the reference is ever unfrozen.
 
 ## Known complications
 
