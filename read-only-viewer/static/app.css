@@ -63,3 +63,7 @@ a.lnk.spill:hover{opacity:1;text-decoration:underline}
    window. Hollow ring, not a filled dot: present, not working. */
 .dot.live.quiet{background:transparent;border:1.5px solid var(--live);box-shadow:none}
 .st.live.quiet{color:var(--idle)}
+/* The same treatment, one layer down: a subagent whose "running" comes from the
+   age window rather than from a stop event. Dimmed green plus the trailing `?`
+   the session header already uses, so inference never renders as fact. */
+.run.quiet{opacity:.55}
