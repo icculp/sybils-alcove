@@ -7,13 +7,17 @@
 //! the "single file, no runtime" property quietly depended on a directory next
 //! to it.
 
+use std::io::Write;
+use std::sync::mpsc::RecvTimeoutError;
 use std::sync::Arc;
+use std::time::Duration;
 
 use tiny_http::{Header, Method, Request, Response, Server};
 
 use crate::collect::Collector;
-use crate::store;
 use crate::config::{Config, COOKIE};
+use crate::events::{Events, Sub};
+use crate::store;
 
 const INDEX: &str = include_str!("../../static/index.html");
 const LOGIN: &str = include_str!("../../static/login.html");
@@ -146,6 +150,12 @@ pub fn serve(cfg: Config) -> i32 {
     );
 
     let collector = Arc::new(Collector::new(cfg.clone()));
+    let events = Arc::new(Events::default());
+    // Kept alive for the process's lifetime: dropping the handle stops the watch
+    // and the page falls back to polling without saying so.
+    let _watch = crate::watch::spawn(&cfg, Arc::clone(&collector), Arc::clone(&events));
+    println!("  events: /api/events{}", if _watch.is_some() { "" } else { " (no watch; poll only)" });
+
     let server = Arc::new(server);
     let workers = std::thread::available_parallelism().map(|p| p.get()).unwrap_or(4).min(8);
 
@@ -153,10 +163,11 @@ pub fn serve(cfg: Config) -> i32 {
     for _ in 0..workers {
         let server = Arc::clone(&server);
         let collector = Arc::clone(&collector);
+        let events = Arc::clone(&events);
         let cfg = cfg.clone();
         handles.push(std::thread::spawn(move || {
             for request in server.incoming_requests() {
-                handle(request, &collector, &cfg);
+                handle(request, &collector, &events, &cfg);
             }
         }));
     }
@@ -166,7 +177,71 @@ pub fn serve(cfg: Config) -> i32 {
     0
 }
 
-fn handle(request: Request, collector: &Collector, cfg: &Config) {
+/// How often an idle stream writes a comment. Long enough to be nearly free,
+/// short enough to stay under the ~60 s idle timeout a reverse proxy or NAT will
+/// otherwise apply to a connection with no traffic. It is also the upper bound on
+/// how long a subscriber whose browser vanished stays in the list: nothing else
+/// can detect that, because a dead TCP peer looks exactly like a quiet one until
+/// something is written.
+const HEARTBEAT: Duration = Duration::from_secs(25);
+
+/// Stream change signals until the client goes away.
+///
+/// Runs on its OWN thread, not a request worker: the whole point is that it blocks
+/// for minutes, and there are eight workers. Written as raw bytes through
+/// `into_writer` rather than a `Response`, because a `Response` wants to know how
+/// much it is going to send.
+///
+/// The payload is a sequence number, deliberately. `/api/sessions` is ~1.7 MB; the
+/// client refetches it through the same cache every other client uses.
+fn stream_events(request: Request, events: Arc<Events>) {
+    let Some(sub) = events.subscribe() else {
+        send(request, b"too many subscribers".to_vec(), "text/plain", 503, None);
+        return;
+    };
+    // Logged on both edges because "does this leak a thread per reconnect" is a
+    // question an operator must be able to answer from the journal alone.
+    println!("events: stream opened ({} open)", events.subscribers());
+    pump(request.into_writer(), &sub, events.seq());
+    // Explicit: the slot is freed by dropping the guard, so the count logged
+    // after it is the count an operator can compare against the one above.
+    drop(sub);
+    println!("events: stream closed ({} open)", events.subscribers());
+}
+
+/// Write frames until one fails. A failed write IS the disconnect notification —
+/// there is no other way to learn that a TCP peer walked away.
+fn pump(mut w: Box<dyn Write + Send>, sub: &Sub, seq: u64) {
+    // No Content-Length and no chunking: `Connection: close` makes end-of-body
+    // end-of-connection, which is exactly what an event stream wants.
+    let head = "HTTP/1.1 200 OK\r\n\
+                Content-Type: text/event-stream\r\n\
+                Cache-Control: no-store\r\n\
+                Connection: close\r\n\
+                X-Accel-Buffering: no\r\n\r\n";
+    // `retry` is advice to EventSource's own reconnect; the client also falls back
+    // to polling, so this only decides how fast the push path comes back.
+    let open = format!("retry: 2000\n: open seq={seq}\n\n");
+    if w.write_all(head.as_bytes()).is_err() || w.write_all(open.as_bytes()).is_err() {
+        return;
+    }
+    let _ = w.flush();
+    loop {
+        let frame = match sub.rx.recv_timeout(HEARTBEAT) {
+            // The seq lets a client notice it missed one across a reconnect. The
+            // event carries no state; "look again" is the whole message.
+            Ok(seq) => format!("event: change\ndata: {{\"seq\":{seq}}}\n\n"),
+            Err(RecvTimeoutError::Timeout) => ": ping\n\n".to_string(),
+            // Every sender gone means the server is shutting down.
+            Err(RecvTimeoutError::Disconnected) => return,
+        };
+        if w.write_all(frame.as_bytes()).is_err() || w.flush().is_err() {
+            return;
+        }
+    }
+}
+
+fn handle(request: Request, collector: &Arc<Collector>, events: &Arc<Events>, cfg: &Config) {
     let url = request.url().to_string();
     let route = url.split('?').next().unwrap_or("/").to_string();
 
@@ -219,6 +294,13 @@ fn handle(request: Request, collector: &Collector, cfg: &Config) {
         "/api/sessions" => {
             let body = serde_json::to_vec(&collector.cached()).unwrap_or_default();
             send(request, body, JSON, 200, None)
+        }
+        // Long-lived, so it leaves the worker pool immediately. Auth has already
+        // been checked above — an EventSource sends the cookie by itself, and
+        // there is no token-in-URL path to fall back on.
+        "/api/events" => {
+            let events = Arc::clone(events);
+            std::thread::spawn(move || stream_events(request, events));
         }
         "/api/activity" => {
             let body = serde_json::to_vec(&activity(&url)).unwrap_or_default();

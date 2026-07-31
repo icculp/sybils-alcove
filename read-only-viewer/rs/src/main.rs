@@ -17,6 +17,8 @@ mod codex;
 mod codex_state;
 mod collect;
 mod config;
+mod events;
+mod liveness;
 mod model;
 mod par;
 mod process;
@@ -24,6 +26,7 @@ mod spill;
 mod spool;
 mod store;
 mod transcripts;
+mod watch;
 mod web;
 
 use std::path::PathBuf;
