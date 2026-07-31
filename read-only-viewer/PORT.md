@@ -38,6 +38,14 @@ rebuild. Installing is the deliberate step that says "ship this one."
 The unit keeps `ProtectHome=read-only` — which is precisely what the read-only
 store open and the copy-then-immutable Codex sqlite read were built for.
 
+**Realtime.** The server watches the transcript roots and the hook spool and
+pushes a change signal on `/api/events` (SSE); the page refetches `/api/sessions`
+and stretches its poll to 60 s while the stream is open. Measured stop-to-browser
+is well under a second. Two things to know when deploying: the signal is a
+sequence number, never the 1.7 MB payload, so nothing here changes bandwidth
+shape; and **process death emits no filesystem event**, so a session flipping to
+`ended` still waits on the pid cache's 15 s cadence.
+
 `deploy/alcove-ingest.{service,timer}` keep the store fresh: `--ingest-only`
 every 5 minutes under the same sandbox plus `ReadWritePaths` for the store and
 `IPAddressDeny=any`, since ingest is entirely local. Nothing else schedules it,

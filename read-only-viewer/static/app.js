@@ -72,8 +72,10 @@ const DOT = {running:'live', writing:'warn', ended:'idle', unknown:'unk'};
 const DOTCLS = s => DOT[s.state] + (s.quiet ? ' quiet' : '');
 function STATE_WHY(s){
   if(s.state === 'running') return s.quiet
-    ? 'process alive (pid '+s.pids.join(', ')+') but the transcript has not '
-      + 'moved in the live window — open, not working'
+    ? 'process alive (pid '+s.pids.join(', ')+') but ' + (s.quiet_inferred
+        ? 'the transcript has not moved in the live window'
+        : 'the harness logged this turn ending at '+HHMM(s.turn_stopped_at))
+      + ' — open, not working'
     : 'process alive: pid '+s.pids.join(', ');
   if(s.state === 'unknown') return 'pid lookup failed — absence proves nothing';
   if(s.state === 'writing') return s.state_inferred
@@ -95,21 +97,37 @@ function compactHTML(s){
   + ' <span class="muted">· totals below span the boundary</span></div>';
 }
 
-// `status` is the parent's launch record. It reads `async_launched` for every
-// backgrounded subagent and never flips to completed, so it cannot mean "done".
-// Only `completed` is terminal; otherwise the child transcript's mtime is the
-// only honest signal, and an idle one may be finished or abandoned.
+// Two sources, and they must not look alike. `state` is folded from the harness's
+// own stop events: `stopped` means a SubagentStop was logged and nothing has
+// happened since, `running` means a tool call landed after any stop. `inferred`
+// means no such event exists for this child — it ran before the hooks did, or it
+// aged out of the spool window — so the answer fell back to the transcript's age
+// and is marked with the same trailing `?` the session header uses.
+//
+// `status` is only the parent's launch record. It reads `async_launched` for every
+// backgrounded subagent and never flips to completed, so it cannot mean "done";
+// it is consulted only when there is nothing better.
 function STATE(s){
   if(s.no_transcript) return '<span class="pill warn">no transcript</span>';
-  if(s.live) return '<span class="run">running</span>';
+  if(s.state === 'stopped') return '<span class="muted" title="SubagentStop '
+    + 'logged at '+esc(s.stopped_at)+'; a later event would mean it resumed">'
+    + 'stopped '+HHMM(s.stopped_at)+'</span>';
+  if(s.state === 'running') return s.inferred
+    ? '<span class="run quiet" title="no stop event on record for this child; '
+      + 'inferred from a transcript written '+AGE(s.age_s)+' ago">running?</span>'
+    : '<span class="run" title="a tool call from this child, with no stop '
+      + 'after it">running</span>';
+  // No stop event and no recent write. "Finished" and "abandoned" look identical
+  // from here, which is exactly why this does not say `stopped`.
   // 'completed' is Claude's spawn record; 'closed'/'open' come from Codex's
   // spawn edge, the only place Codex writes down that a subagent finished.
   if(s.status === 'completed' || s.status === 'closed')
-    return '<span class="muted">done</span>';
+    return '<span class="muted" title="from the parent\'s spawn record, not a '
+      + 'stop event">done?</span>';
   if(s.status === 'open') return '<span class="muted" title="Codex still has '
     + 'this spawn open, but the transcript has been idle">open · idle</span>';
-  return '<span class="muted" title="launched in the background with no '
-    + 'completion record; transcript has been idle">idle</span>';
+  return '<span class="muted" title="no stop event and no recent write; '
+    + 'finished and abandoned look the same from here">idle</span>';
 }
 
 // A subagent with no transcript has nothing to stream, so it gets no link
@@ -128,8 +146,11 @@ function subTable(subs, sid){
         + '<th></th></tr>';
   for(const s of subs){
     const mism = s.record_model && s.model && s.record_model !== s.model;
+    // Hollow ring for an inferred "running", filled for one the harness
+    // confirmed — the same treatment a quiet session already gets.
+    const dot = s.state === 'running' ? (s.inferred ? 'live quiet' : 'live') : 'idle';
     h += '<tr>'
-      + '<td><span class="dot '+(s.live?'live':'idle')+'" '
+      + '<td><span class="dot '+dot+'" '
       +   'style="display:inline-block;margin-right:6px"></span><code>'+esc(s.label)+'</code>'
       +   (s.nickname?' <span class="nm">'+esc(s.nickname)+'</span>':'')+'</td>'
       + '<td class="muted">'+esc(s.role||'—')+'</td>'
@@ -233,16 +254,49 @@ function render(d){
 }
 
 let data = null, timer = null;
+// One fetch at a time. A burst of change events must not stack 1.7 MB requests;
+// the last one still runs, so nothing is missed.
+let inflight = false, again = false;
 async function load(){
+  if(inflight){ again = true; return; }
+  inflight = true;
   try{
     const r = await fetch('/api/sessions', {cache:'no-store'});
     data = await r.json();
     render(data);
   }catch(e){ document.getElementById('stat').textContent = 'error: '+e; }
+  finally{
+    inflight = false;
+    if(again){ again = false; load(); }
+  }
+}
+
+// The server pushes a change signal when a transcript or a hook spool line moves,
+// so polling becomes the fallback rather than the mechanism. The poll is stretched
+// rather than stopped: if the stream dies in a way EventSource does not report,
+// a 60 s refresh still beats a page frozen forever.
+const PUSH_MS = 60000, POLL_MS = 3000;
+let stream = null, pushing = false;
+function transport(text, cls){
+  const el = document.getElementById('stream');
+  if(el){ el.textContent = text; el.className = cls; }
 }
 function arm(){
   if(timer) clearInterval(timer);
-  if(document.getElementById('auto').checked) timer = setInterval(load, 3000);
+  if(!document.getElementById('auto').checked){ transport('paused','muted'); return; }
+  timer = setInterval(load, pushing ? PUSH_MS : POLL_MS);
+  transport(pushing ? 'push' : 'poll 3s', pushing ? 'run' : 'muted');
+}
+function connect(){
+  if(!window.EventSource) return;         // no push: the poll above is the answer
+  stream = new EventSource('/api/events');
+  stream.onopen = () => { pushing = true; arm(); };
+  // The signal carries a sequence number, not the payload: refetch through the
+  // same cached endpoint the poll uses.
+  stream.addEventListener('change', load);
+  // EventSource reconnects on its own; until it does, poll. Never silently
+  // present a dead stream as a live one.
+  stream.onerror = () => { pushing = false; arm(); };
 }
 document.getElementById('auto').addEventListener('change', arm);
 document.getElementById('now').addEventListener('click', load);
@@ -252,4 +306,4 @@ document.getElementById('expand').addEventListener('click', () => {
 document.getElementById('collapse').addEventListener('click', () => {
   for(const s of data.sessions) collapsed.add(s.session_id);
   saveCollapsed(); last=''; render(data); });
-load(); arm();
+load(); arm(); connect();

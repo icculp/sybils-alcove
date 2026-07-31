@@ -18,12 +18,13 @@
 //! | `v` | schema version, `1` |
 //! | `ts` | ISO-8601 UTC, ms |
 //! | `harness` | `"claude"` \| `"codex"` |
-//! | `event` | `"pre"` \| `"post"` |
-//! | `session_id` | |
-//! | `tool` | |
+//! | `event` | `"pre"` \| `"post"` \| `"stop"` \| `"subagent_stop"` |
+//! | `session_id` | the session's own id — the PARENT's on a child's line |
+//! | `tool` | `""` on the stop family, never null |
 //! | `cwd`, `target`, `arg` | nullable; `arg` is capped at 500 chars |
 //! | `ok` | bool or null — null on a `pre`, where the answer is not known yet |
 //! | `tool_use_id` | string or null |
+//! | `agent_id`, `agent_type` | nullable, additive; null means "the session itself" |
 //!
 //! ## A skipped line is counted, never swallowed
 //!
@@ -77,6 +78,18 @@ pub struct ToolCall {
     pub ok: Option<bool>,
     #[serde(default)]
     pub tool_use_id: Option<String>,
+    /// Which agent acted: a child's `agent_id`, or `None` for the session's own
+    /// turn. ADDITIVE and still `v: 1` — a line written before the hook learned
+    /// to send it parses with `None`, which is what such a line means to a
+    /// reader that cannot tell parent from child anyway. Bumping the version
+    /// would have made every deployed reader skip every new line.
+    #[serde(default)]
+    pub agent_id: Option<String>,
+    /// `Explore`, `general-purpose`, … Only used to label a child whose parent
+    /// spawn record is missing; the transcript is the better source when it
+    /// exists.
+    #[serde(default)]
+    pub agent_type: Option<String>,
 }
 
 /// FNV-1a, 128-bit. Hand-rolled rather than pulling in a hash crate, and NOT
@@ -189,6 +202,134 @@ pub fn read_all() -> SpoolRead {
     read_dir(&spool_dir())
 }
 
+/// Civil date from a unix timestamp, UTC (Howard Hinnant's algorithm).
+///
+/// Spool files are named on the UTC date, so picking "today and yesterday"
+/// is date arithmetic, not a mtime comparison: a file that has not been
+/// appended to since midnight still holds this morning's events.
+pub fn utc_ymd(secs: i64) -> (i64, i64, i64) {
+    let days = secs.div_euclid(86400);
+    let z = days + 719468;
+    let era = z.div_euclid(146097);
+    let doe = z.rem_euclid(146097);
+    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
+    let y = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    (if m <= 2 { y + 1 } else { y }, m, d)
+}
+
+/// One spool file's parse, cached on `(size, mtime)`.
+///
+/// `Arc` because this is cloned out of the cache on every collect and a busy day
+/// is thousands of events: the clone must be a refcount bump, not a deep copy.
+#[derive(Clone)]
+pub struct FileParse {
+    pub calls: std::sync::Arc<Vec<ToolCall>>,
+    pub skipped: u64,
+    /// `Some(reason)` when the file would not open. Never conflated with an empty
+    /// parse, which is a real answer.
+    pub unreadable: Option<String>,
+}
+
+pub type SpoolCache = crate::cache::ScanCache<FileParse>;
+
+impl FileParse {
+    fn of(path: &Path) -> Self {
+        let mut calls = Vec::new();
+        let mut skipped = 0u64;
+        let mut unreadable = None;
+        match std::fs::read(path) {
+            Ok(bytes) => {
+                // Lossy: a torn write can cut a UTF-8 sequence, and one bad byte
+                // must cost one line rather than the whole file.
+                let text = String::from_utf8_lossy(&bytes);
+                parse_lines(&text, &mut calls, &mut skipped);
+            }
+            Err(e) => unreadable = Some(e.to_string()),
+        }
+        Self { calls: std::sync::Arc::new(calls), skipped, unreadable }
+    }
+}
+
+/// The `YYYYMMDD` stamps a spool filename may carry, for `days` back including
+/// today. `days = 2` is today and yesterday.
+pub fn recent_stamps(now_secs: i64, days: i64) -> Vec<String> {
+    (0..days.max(1))
+        .map(|back| {
+            let (y, m, d) = utc_ymd(now_secs - back * 86400);
+            format!("{y:04}{m:02}{d:02}")
+        })
+        .collect()
+}
+
+/// Read only the last `days` UTC days of spool, caching each file's parse on
+/// `(size, mtime)`.
+///
+/// Liveness only ever asks about *now*, and the whole spool grows without bound
+/// — a month of it would be re-parsed on every collect to answer a question
+/// about the last few minutes. Two days is the window because a session that
+/// started at 23:50 UTC has its stop in tomorrow's file, and its start in
+/// yesterday's.
+///
+/// The cache is a real win only between bursts: the current day's file is
+/// appended to constantly, so it re-parses whenever it grows. That is bounded by
+/// one day of hook lines (~65 KB after five busy hours), which is why re-reading
+/// the whole file is preferred over byte-offset resume — the fold below is a
+/// pure per-line accumulation and could be made resumable, but has not needed to
+/// be.
+pub fn read_window(dir: &Path, days: i64, cache: &SpoolCache) -> SpoolRead {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0);
+    let stamps = recent_stamps(now, days);
+    let mut out = SpoolRead { dir: dir.to_path_buf(), ..Default::default() };
+    let entries = match std::fs::read_dir(dir) {
+        Ok(e) => e,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return out,
+        Err(e) => {
+            out.errors.push(format!("{}: {e}", dir.display()));
+            return out;
+        }
+    };
+    let mut paths: Vec<PathBuf> = Vec::new();
+    for entry in entries {
+        match entry {
+            Ok(e) => {
+                let path = e.path();
+                let name = path.file_name().map(|n| n.to_string_lossy().to_string());
+                let keep = name
+                    .as_deref()
+                    .map(|n| n.ends_with(".jsonl") && stamps.iter().any(|s| n.contains(s.as_str())))
+                    .unwrap_or(false);
+                if keep {
+                    paths.push(path);
+                }
+            }
+            Err(e) => out.errors.push(format!("{}: {e}", dir.display())),
+        }
+    }
+    paths.sort();
+    let mut read = 0usize;
+    for path in &paths {
+        // The skip count is part of the cached parse, not recomputed on a hit:
+        // "0 skipped because the file is clean" and "0 skipped because we did not
+        // look" are different answers, and only one of them is true here.
+        let parsed = cache.get_or_scan(path, || FileParse::of(path));
+        out.calls.extend(parsed.calls.iter().cloned());
+        out.skipped += parsed.skipped;
+        if let Some(err) = &parsed.unreadable {
+            out.errors.push(format!("{}: {err}", path.display()));
+        }
+        read += 1;
+    }
+    out.files = Some(read);
+    out
+}
+
 pub fn read_dir(dir: &Path) -> SpoolRead {
     let mut out = SpoolRead { dir: dir.to_path_buf(), ..Default::default() };
     let entries = match std::fs::read_dir(dir) {
@@ -289,6 +430,66 @@ mod tests {
         let (calls, skipped) = parse(&LINE.replace(r#""arg":"ls""#, &format!(r#""arg":"{long}""#)));
         assert_eq!(skipped, 0);
         assert_eq!(calls[0].arg.as_deref().unwrap().chars().count(), MAX_ARG);
+    }
+
+    /// Verbatim from the live spool. The stop family is the whole point of the
+    /// fold, and `tool: ""` / `tool_use_id: null` on it is exactly the shape that
+    /// a stricter type would have silently dropped.
+    const STOP_LINE: &str = r#"{"v":1,"ts":"2026-07-30T14:38:03.588Z","harness":"claude","event":"subagent_stop","session_id":"b3d712dd-e4b8-459b-bb92-b717a5072968","tool":"","cwd":"/root","target":"ab5bd1b2bfa719c8e","arg":"/root/.claude/projects/-root/b3d712dd-e4b8-459b-bb92-b717a5072968/subagents/agent-ab5bd1b2bfa719c8e.jsonl","ok":null,"tool_use_id":null}"#;
+
+    #[test]
+    fn stop_family_lines_are_valid_not_malformed() {
+        let (calls, skipped) = parse(&format!(
+            "{STOP_LINE}\n{}\n",
+            STOP_LINE.replace("\"subagent_stop\"", "\"stop\"")
+        ));
+        assert_eq!(skipped, 0, "a stop line is a v1 line, not garbage");
+        assert_eq!(calls.len(), 2);
+        assert_eq!(calls[0].event, "subagent_stop");
+        assert_eq!(calls[0].tool, "");
+        assert_eq!(calls[0].target.as_deref(), Some("ab5bd1b2bfa719c8e"));
+        // Two events at the same instant with no tool_use_id must not collapse.
+        assert_ne!(calls[0].id(), calls[1].id());
+    }
+
+    #[test]
+    fn agent_fields_are_optional() {
+        // Old line: no agent_id at all.
+        let (old, skipped) = parse(LINE);
+        assert_eq!(skipped, 0);
+        assert!(old[0].agent_id.is_none(), "absent means 'the session itself'");
+        let child = LINE.replace(
+            r#""tool_use_id":"toolu_A""#,
+            r#""tool_use_id":"toolu_A","agent_id":"ac76b5442617a9edf","agent_type":"Explore""#,
+        );
+        let (new, skipped) = parse(&child);
+        assert_eq!(skipped, 0, "an added field does not make a line a different version");
+        assert_eq!(new[0].agent_id.as_deref(), Some("ac76b5442617a9edf"));
+        assert_eq!(new[0].agent_type.as_deref(), Some("Explore"));
+    }
+
+    #[test]
+    fn the_window_reads_today_and_yesterday_only() {
+        // 2026-07-30T12:00:00Z
+        let now = 1785412800i64;
+        let stamps = recent_stamps(now, 2);
+        assert_eq!(stamps, vec!["20260730".to_string(), "20260729".to_string()]);
+        let dir = std::env::temp_dir().join(format!("alcove-spool-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        for stamp in ["20260730", "20260101"] {
+            std::fs::write(dir.join(format!("claude-{stamp}.jsonl")), format!("{LINE}\n")).unwrap();
+        }
+        let cache = SpoolCache::default();
+        let read = read_window(&dir, 2, &cache);
+        // Only the file whose NAME is in the window; the January one is skipped
+        // without being opened, which is the point.
+        assert_eq!(read.files, Some(1));
+        assert_eq!(read.calls.len(), 1);
+        let again = read_window(&dir, 2, &cache);
+        assert_eq!(again.calls.len(), 1);
+        assert_eq!(cache.stats().0, 1, "an unchanged file is served from the cache");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
