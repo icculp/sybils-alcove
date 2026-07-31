@@ -52,3 +52,8 @@ body.wrap .ev .c pre{white-space:pre-wrap;overflow-wrap:anywhere}
    the word "file_path". */
 .args .a{margin-right:12px}
 .args .a i{color:var(--idle);font-style:normal}
+
+/* The reasoning marker is where effort actually earns a visible place: the
+   content is not on disk, so how hard the model was told to think is the only
+   thing there is to say about it. Absent effort adds nothing here. */
+.ev.reasoning .eff{color:var(--sub);font-style:normal;font-weight:600}

@@ -53,5 +53,25 @@ purpose are listed here, so a reader is never misled about which is correct:
   adds a `thread_id` column and keys on `(id, thread_id)`. The reference keeps
   the original single-column key and therefore still drops those rows.
 
+- **Per-turn `effort` and `version` (Rust only).** The Rust scanners trace the
+  reasoning effort each turn was served at (both harnesses) and the harness build
+  that served it (Claude only — Codex records one `cli_version` per rollout, and
+  a resumed rollout replays turns an older build served). This reference does not
+  learn either; its `turn` table has neither column. It also keeps its original
+  `effort` reader, which accepts only `{"level": ...}` — a shape that occurs
+  **zero times** in 19,783 events carrying the field, so it reports `""` for
+  every session. That is why `effort` is excluded from the canonical snapshot
+  comparison; `tools/store_equivalence.py` asserts the split instead.
+
+- **Codex `turn_context` is per TURN, not per session.** The bullet above saying
+  "once per session" is what the original measurement showed and is wrong for
+  current Codex: one measured rollout has 153 of them against 126 `task_started`.
+  It still is not the turn signal — count assistant messages — but it is a turn
+  boundary, and **its timestamp is not usable**: on resume Codex replays the whole
+  history and restamps every replayed line with the file-open time (151 of those
+  153 share three seconds). Rust records effort switches at the timestamp of the
+  turn they governed instead; the divergence between the two reaches 37.8 s on a
+  live turn in that same file.
+
 The browser UI in `../static/` is **shared**, not part of this reference — both
 implementations serve the same files.

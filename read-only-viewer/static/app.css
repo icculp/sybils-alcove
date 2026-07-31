@@ -67,3 +67,13 @@ a.lnk.spill:hover{opacity:1;text-decoration:underline}
    age window rather than from a stop event. Dimmed green plus the trailing `?`
    the session header already uses, so inference never renders as fact. */
 .run.quiet{opacity:.55}
+/* Effort is a fact about how the turn was served, like the model — so it reads
+   as a sibling of `.model`, not as another grey pill lost among project/branch.
+   Absent effort has no element at all; there is no "unset" colour, because
+   "not recorded" is not a level. */
+.eff{color:var(--sub);font-weight:600}
+.pill.eff{border-color:color-mix(in srgb,var(--sub) 45%,transparent);
+color:var(--sub)}
+/* Version is provenance, not status: dim like the timeline it sits in, so an
+   upgrade line never competes with a model or effort switch for attention. */
+.ver{color:var(--fg);opacity:.8}

@@ -28,6 +28,16 @@ function args(value) {
 const LABEL = {assistant: 'says', user: 'user', tool_use: 'calls',
                tool_result: 'result', reasoning: 'thinks', compact: 'compact'};
 
+// Effort and harness version ride the timestamp's tooltip rather than taking a
+// column: they are the same on most consecutive rows, and a column of repeated
+// values buries the stream this page exists to show. Absent means absent — a row
+// the harness did not stamp gets no tooltip at all, never a default.
+function why(e) {
+  const parts = [e.effort ? 'effort ' + e.effort : '',
+                 e.version ? 'harness ' + e.version : ''].filter(Boolean);
+  return parts.length ? ` title="${esc(parts.join(' · '))}"` : '';
+}
+
 function row(e) {
   const cls = e.kind + (e.error ? ' err' : '');
   const cut = e.truncated ? '<span class="cut">TRUNCATED</span>' : '';
@@ -37,13 +47,14 @@ function row(e) {
          + `<span class="args">${args(e.args)}</span></div>`;
   } else if (e.kind === 'reasoning') {
     // Never render this as empty text — see the note in the header.
-    body = 'reasoning (not recorded on disk)';
+    body = 'reasoning (not recorded on disk)'
+         + (e.effort ? ` <span class="eff">${esc(e.effort)}</span>` : '');
   } else if (e.kind === 'compact') {
     body = '<span class="muted">— context compacted —</span>';
   } else {
     body = `<pre>${esc(e.text)}</pre>`;
   }
-  return `<div class="ev ${cls}"><span class="t">${esc(clock(e.ts))}</span>`
+  return `<div class="ev ${cls}"><span class="t"${why(e)}>${esc(clock(e.ts))}</span>`
        + `<span class="k">${LABEL[e.kind] || e.kind}</span>`
        + `<div class="c">${body}${cut}</div></div>`;
 }

@@ -46,7 +46,14 @@ def session(s: dict) -> dict:
         "harness": s["harness"], "session_id": s["session_id"],
         "label": s.get("label", ""), "project": s.get("project", ""),
         "cwd": s.get("cwd", ""), "branch": s.get("branch", ""),
-        "effort": s.get("effort", ""), "model": s.get("model", ""),
+        # `effort` is DELIBERATELY not compared. The frozen reference reads it
+        # as {"level": ...}, a shape that occurs zero times in 19,783 real
+        # events, so it reports "" for every session; Rust reads the bare string
+        # the harness actually writes. Leaving it in turns a documented, one-way
+        # divergence into a permanent gate failure that trains people to ignore
+        # the gate. The split is asserted instead — see store_equivalence.py's
+        # `check_columns`, which fails if the reference ever starts reporting it.
+        "model": s.get("model", ""),
         "selected_model": s.get("selected_model", ""),
         "turns": int(s.get("turns") or 0), "last_ts": s.get("last_ts", ""),
         "usage": usage(s.get("usage") or {}),

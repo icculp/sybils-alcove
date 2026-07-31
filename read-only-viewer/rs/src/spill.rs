@@ -13,6 +13,7 @@ use std::path::Path;
 
 use serde_json::{json, Map, Value};
 
+use crate::model::event_effort;
 use crate::transcripts::{chronological, tail_events};
 
 /// Per-event text cap. Tool results run to megabytes; the browser wants a peek,
@@ -136,6 +137,13 @@ fn spill_claude(path: &Path) -> Vec<Value> {
             continue;
         }
         let model = message.get("model").and_then(Value::as_str).unwrap_or("").to_string();
+        // Stamped on the EVENT, so the stream can say which effort served each
+        // line rather than only what the session is set to now. "" where the
+        // transcript does not say, and the page renders that as nothing.
+        let effort = event_effort(&ev);
+        // The build that wrote the line. Codex has no per-event equivalent, so
+        // its rows carry none — absent, not blank-as-a-value.
+        let version = ev.get("version").and_then(Value::as_str).unwrap_or("").to_string();
         let owned;
         let blocks: &Vec<Value> = match message.get("content") {
             Some(Value::Array(a)) => a,
@@ -151,6 +159,9 @@ fn spill_claude(path: &Path) -> Vec<Value> {
                 Some("thinking") => {
                     let mut e = event("reasoning", &ts);
                     e.insert("model".into(), json!(model));
+                    e.insert("effort".into(), json!(effort));
+                    e.insert("version".into(), json!(version));
+                    e.insert("version".into(), json!(version));
                     out.push(Value::Object(e));
                 }
                 Some("text") => {
@@ -162,6 +173,8 @@ fn spill_claude(path: &Path) -> Vec<Value> {
                         e.insert("text".into(), json!(text));
                         e.insert("truncated".into(), json!(cut));
                         e.insert("model".into(), json!(model));
+                        e.insert("effort".into(), json!(effort));
+                        e.insert("version".into(), json!(version));
                         out.push(Value::Object(e));
                     }
                 }
@@ -171,6 +184,8 @@ fn spill_claude(path: &Path) -> Vec<Value> {
                     e.insert("tool_id".into(), json!(obj.get("id").and_then(Value::as_str).unwrap_or("")));
                     e.insert("args".into(), shrink(obj.get("input").unwrap_or(&Value::Null), 0));
                     e.insert("model".into(), json!(model));
+                    e.insert("effort".into(), json!(effort));
+                    e.insert("version".into(), json!(version));
                     out.push(Value::Object(e));
                 }
                 Some("tool_result") => {
@@ -191,6 +206,12 @@ fn spill_claude(path: &Path) -> Vec<Value> {
 
 fn spill_codex(path: &Path) -> Vec<Value> {
     let mut out: Vec<Value> = Vec::new();
+    // Codex records the effort once per turn, on `turn_context`, and not on the
+    // events it governs — so it is carried forward in stream ORDER. The
+    // turn_context timestamp is not usable (a resume restamps every replayed
+    // line with the file-open time; see codex.rs) but its position is, and
+    // position is all this needs.
+    let mut effort = String::new();
     for ev in chronological(tail_events(path), "timestamp") {
         let kind = ev.get("type").and_then(Value::as_str).unwrap_or("");
         let ts = ev.get("timestamp").and_then(Value::as_str).unwrap_or("").to_string();
@@ -198,6 +219,14 @@ fn spill_codex(path: &Path) -> Vec<Value> {
             continue;
         };
         let ptype = payload.get("type").and_then(Value::as_str).unwrap_or("");
+        if kind == "turn_context" {
+            if let Some(e) = payload.get("effort").and_then(Value::as_str) {
+                if !e.is_empty() {
+                    effort = e.to_string();
+                }
+            }
+            continue;
+        }
 
         if kind == "compacted" || ptype == "context_compacted" {
             // One compaction is written twice, milliseconds apart. Compare at
@@ -216,7 +245,11 @@ fn spill_codex(path: &Path) -> Vec<Value> {
             continue;
         }
         match ptype {
-            "reasoning" => out.push(Value::Object(event("reasoning", &ts))),
+            "reasoning" => {
+                let mut e = event("reasoning", &ts);
+                e.insert("effort".into(), json!(effort));
+                out.push(Value::Object(e));
+            }
             "message" => {
                 let role = payload.get("role").and_then(Value::as_str).unwrap_or("");
                 // `developer` is the injected system preamble, re-sent every
@@ -229,6 +262,9 @@ fn spill_codex(path: &Path) -> Vec<Value> {
                     let mut e = event(role, &ts);
                     e.insert("text".into(), json!(text));
                     e.insert("truncated".into(), json!(cut));
+                    if role == "assistant" {
+                        e.insert("effort".into(), json!(effort));
+                    }
                     out.push(Value::Object(e));
                 }
             }

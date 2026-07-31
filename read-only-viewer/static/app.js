@@ -44,6 +44,42 @@ function timelineHTML(t){
   ).join(' <span class="muted">→</span> ') + '</div>';
 }
 
+// Effort switches, drawn exactly like model switches because they are the same
+// kind of fact: what the harness was actually running at, turn by turn. A
+// session that never changed effort has nothing to show here — one entry is a
+// setting, not a trace — and one that recorded no effort at all has no entries,
+// which must read as silence rather than as a level.
+//
+// Codex writes effort on `turn_context`, whose timestamp a resume overwrites
+// with the file-open time; the server therefore stamps each entry with the
+// TURN's own time, so these clocks are comparable with the served timeline.
+function effortHTML(t){
+  if(!t || t.length < 2) return '';
+  return '<div class="tl">effort: ' + t.map(x =>
+    '<span class="eff">'+esc(x.effort)+'</span>'
+    + (x.at?' <span class="muted">'+HHMM(x.at)+'</span>':'')
+  ).join(' <span class="muted">→</span> ')
+  + ' <span class="muted">· '+(t.length-1)+' switch'+(t.length>2?'es':'')
+  + '</span></div>';
+}
+
+// Harness version. Deliberately quiet: the steady state is uninteresting (it is
+// whatever happens to be installed) and belongs in the harness chip's tooltip,
+// while the SWITCH is the fact worth a line — a session left open across
+// upgrades has its turns served by different builds, and "which version was
+// running when this broke" is otherwise unanswerable. Claude stamps it on every
+// event; Codex writes it once per rollout, so a Codex session has a version and
+// no trace, and that absence is the honest render.
+function versionHTML(t){
+  if(!t || t.length < 2) return '';
+  return '<div class="tl">harness: ' + t.map(x =>
+    '<span class="ver">'+esc(x.version)+'</span>'
+    + (x.at?' <span class="muted">'+HHMM(x.at)+'</span>':'')
+  ).join(' <span class="muted">→</span> ')
+  + ' <span class="muted">· '+(t.length-1)+' upgrade'+(t.length>2?'s':'')
+  + ' inside this session</span></div>';
+}
+
 // Operator selections, from the `/model` command record. Shown separately from
 // the served timeline because a model can be selected and never serve a turn —
 // which is invisible in `message.model` and was why switches looked unlogged.
@@ -140,7 +176,8 @@ function spillLink(sid, agent){
 
 function subTable(subs, sid){
   if(!subs.length) return '<div class="empty">no subagents</div>';
-  let h = '<table><tr><th>subagent</th><th>role</th><th>model</th><th>state</th>'
+  let h = '<table><tr><th>subagent</th><th>role</th><th>model</th><th>effort</th>'
+        + '<th>state</th>'
         + '<th class="num">turns</th><th class="num">out</th><th class="num">in</th>'
         + '<th class="num">cache rd</th><th class="num">age</th><th>task</th>'
         + '<th></th></tr>';
@@ -151,12 +188,19 @@ function subTable(subs, sid){
     const dot = s.state === 'running' ? (s.inferred ? 'live quiet' : 'live') : 'idle';
     h += '<tr>'
       + '<td><span class="dot '+dot+'" '
-      +   'style="display:inline-block;margin-right:6px"></span><code>'+esc(s.label)+'</code>'
+      +   'style="display:inline-block;margin-right:6px"></span><code'
+      +   (s.version?' title="harness '+esc(s.version)+'"':'')+'>'+esc(s.label)+'</code>'
       +   (s.nickname?' <span class="nm">'+esc(s.nickname)+'</span>':'')+'</td>'
       + '<td class="muted">'+esc(s.role||'—')+'</td>'
       + '<td><span class="model sm">'+esc(s.model||'unknown')+'</span>'
       +   (mism?' <span class="pill warn">rec '+esc(s.record_model)+'</span>':'')
       +   (s.timeline&&s.timeline.length>1?' <span class="pill warn">'+(s.timeline.length-1)+' sw</span>':'')+'</td>'
+      // A child transcript records its own effort. Em dash where it does not:
+      // "not recorded" and "low" must not look the same.
+      + '<td>'+(s.effort?'<span class="eff">'+esc(s.effort)+'</span>'
+      +   (s.effort_timeline&&s.effort_timeline.length>1
+            ?' <span class="pill warn">'+(s.effort_timeline.length-1)+' sw</span>':'')
+      : '<span class="muted">—</span>')+'</td>'
       + '<td>'+STATE(s)+'</td>'
       + '<td class="num">'+K(s.turns)+'</td>'
       + '<td class="num">'+K(s.usage.output)+'</td>'
@@ -204,7 +248,11 @@ function render(d){
     h += '<div class="s'+open+'" data-id="'+esc(s.session_id)+'">'
       + '<div class="shead"><span class="caret"></span>'
       + '<span class="dot '+DOTCLS(s)+'" title="'+STATE_WHY(s)+'"></span>'
-      + '<span class="hz">'+esc(s.harness)+'</span>'
+      + '<span class="hz"'+(s.version?' title="'+esc(s.harness)+' '+esc(s.version)
+          +((s.version_timeline&&s.version_timeline.length>1)
+            ?' · '+(s.version_timeline.length-1)+' upgrade'
+              +(s.version_timeline.length>2?'s':'')+' inside this session':'')
+          +'"':'')+'>'+esc(s.harness)+'</span>'
       + '<span class="st '+DOTCLS(s)+'">'+s.state+(s.quiet?' · quiet':'')
       +   (s.state_inferred&&s.state!=='ended'?'?':'')+'</span>'
       + '<span class="sid">'+esc(s.label)+'</span>'
@@ -216,7 +264,16 @@ function render(d){
           +SW(s)+' switch'+(SW(s)>1?'es':'')+'</span>':'')
       + (MISMATCH(s)?'<span class="pill warn" title="selected but the last turn '
           +'was served by a different model">sel '+esc(s.selected_model)+'</span>':'')
-      + (s.effort?'<span class="pill">'+esc(s.effort)+'</span>':'')
+      // Absent effort renders as nothing at all — no pill, no placeholder.
+      // Most of this corpus predates the field and a default would be a claim.
+      + (s.effort?'<span class="pill eff" title="reasoning effort'
+          +((s.effort_timeline&&s.effort_timeline.length>1)
+            ?'; '+(s.effort_timeline.length-1)+' switch'
+              +(s.effort_timeline.length>2?'es':'')+' in the tail window':'')
+          +'">'+esc(s.effort)
+          +((s.effort_timeline&&s.effort_timeline.length>1)
+            ?' <span class="muted">×'+s.effort_timeline.length+'</span>':'')
+          +'</span>':'')
       + '<span class="pill">'+esc(s.project)+'</span>'
       + (s.branch?'<span class="pill">'+esc(s.branch)+'</span>':'')
       + '<span class="grow"></span>'
@@ -237,6 +294,7 @@ function render(d){
       + '<span class="muted">'+AGE(s.age_s)+'</span>'
       + spillLink(s.session_id,'')
       + '</div><div class="body">'+selectionHTML(s)+timelineHTML(s.timeline)
+      + effortHTML(s.effort_timeline)+versionHTML(s.version_timeline)
       + compactHTML(s)+subTable(s.subagents, s.session_id)+'</div></div>';
   }
   h = h || '<p class="muted">no sessions match this filter</p>';
