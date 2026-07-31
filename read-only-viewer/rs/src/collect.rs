@@ -332,6 +332,10 @@ impl Collector {
                     }
                     json!({
                         "id": a.id, "label": a.label, "model": a.model,
+                        // A child transcript is a full transcript, so its effort
+                        // is observed, not inherited from the parent.
+                        "effort": a.effort, "effort_timeline": a.effort_timeline,
+                        "version": a.version, "version_timeline": a.version_timeline,
                         "record_model": a.record_model, "role": role,
                         "status": a.status, "turns": a.turns, "usage": a.usage,
                         "reported_tokens": Value::Null, "tool_uses": Value::Null,
@@ -363,7 +367,9 @@ impl Collector {
             out.push(json!({
                 "harness": "claude", "session_id": s.session_id, "label": s.label,
                 "project": s.project, "cwd": s.cwd, "branch": s.branch,
-                "effort": s.effort, "model": s.model,
+                "effort": s.effort, "effort_timeline": s.effort_timeline,
+                "version": s.version, "version_timeline": s.version_timeline,
+                "model": s.model,
                 "selected_model": s.selected_model, "selections": s.selections,
                 "timeline": s.timeline, "usage": s.usage, "turns": s.turns,
                 "last_ts": s.last_ts, "age_s": age, "live": live,
@@ -415,6 +421,8 @@ impl Collector {
                         sub_state(fold.child(&a.id, None, now, window_ms), a.live);
                     json!({
                         "id": a.id, "label": a.label, "model": a.model,
+                        "effort": a.effort, "effort_timeline": a.effort_timeline,
+                        "version": a.version, "version_timeline": Vec::<Value>::new(),
                         "record_model": "", "role": a.role, "status": a.status,
                         "nickname": a.nickname,
                         "turns": a.turns, "usage": a.usage,
@@ -437,7 +445,12 @@ impl Collector {
                 "harness": "codex", "session_id": s.session_id, "label": s.label,
                 "project": s.project, "cwd": s.cwd, "branch": s.branch,
                 "nickname": s.nickname,
-                "effort": s.effort, "model": s.model,
+                "effort": s.effort, "effort_timeline": s.effort_timeline,
+                // Codex has one version per rollout and no per-turn record, so
+                // the trace is EMPTY rather than a one-entry timeline pretending
+                // to be one. See codex.rs on `multi_agent_version`.
+                "version": s.version, "version_timeline": Vec::<Value>::new(),
+                "model": s.model,
                 "selected_model": "", "selections": Vec::<Value>::new(),
                 "timeline": s.timeline, "usage": s.usage, "turns": s.turns,
                 "last_ts": s.last_ts, "age_s": age, "live": live,
