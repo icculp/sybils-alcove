@@ -17,6 +17,10 @@ import sys
 
 SPOOL_DIR = "/root/.local/state/alcove/spool"
 
+# An ADDITIVE nullable field does not bump this. A reader that does not know the
+# field ignores it; a reader that does treats absent as null, which is exactly
+# what an old line means. Bumping v would make every current reader skip every
+# new line -- counted as malformed -- to gain nothing.
 SCHEMA_VERSION = 1
 
 EVENT_MAP = {
@@ -270,6 +274,15 @@ def main():
         "arg": arg,
         "ok": ok,
         "tool_use_id": tool_use_id,
+        # Which agent acted. `session_id` on a child's tool call is the PARENT's
+        # -- verified by capture -- so without this a child's activity cannot be
+        # told from its parent's, and "this subagent is still working" has no
+        # authoritative source. Both harnesses put `agent_id`/`agent_type` at the
+        # top level of a child's tool payload and omit them for the parent's own
+        # calls (including the `Agent`/`Task` call that spawned the child), so
+        # null here means "the session itself", not "unknown".
+        "agent_id": _str(payload.get("agent_id"), MAX_FIELD),
+        "agent_type": _str(payload.get("agent_type"), MAX_FIELD),
     }
 
     def encode(rec):

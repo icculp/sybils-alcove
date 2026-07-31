@@ -30,6 +30,13 @@ written with a single `O_APPEND` `write()` of at most **2048 bytes**.
 | `arg` | str \| null | tool events: head of the primary argument, ≤500 chars (for a shell tool, the command head). `subagent_stop`: the child's transcript path |
 | `ok` | bool \| null | `post` only; `null` when not cheaply determinable |
 | `tool_use_id` | str \| null | the harness's own id for the call; `null` on stop-family events |
+| `agent_id` | str \| null | WHICH agent acted: a child's id, or `null` for the session's own turn |
+| `agent_type` | str \| null | that child's kind (`Explore`, `general-purpose`, …) |
+
+`agent_id` / `agent_type` were **added without bumping `v`**, and that is the
+point: they are nullable and additive, an old line means exactly what a `null`
+means, and a version bump would have made every deployed reader skip every new
+line to gain nothing. `v` moves when an existing field changes meaning.
 
 Caps are hard, not advisory: `arg` and `target` ≤500 chars, `tool` /
 `session_id` / `tool_use_id` ≤200, and the assembled line ≤2048 bytes. If a line
@@ -85,12 +92,43 @@ Codex's `subagent-stop.command.input` schema **requires the same three field
 names** (`agent_id`, `agent_transcript_path`, `agent_type`), so one mapping serves
 both harnesses.
 
-`agent_type` (`Explore`, `general-purpose`, `spark-triage`, …) is present in both
-harnesses' payloads and has **no field in the contract**, so it is not spooled. If
-the viewer wants to label a stopped child by kind, that is a v2 field — it is not
-smuggled into `tool`.
-
 `last_assistant_message` is a message body and is never read.
+
+#### A child's own tool calls carry the PARENT's `session_id` (verified)
+
+Measured, not assumed, because the state fold depends on it. A `claude -p` turn
+was run with a hook that dumped every payload verbatim, and it spawned an
+`Explore` subagent. What came back, in order:
+
+| event | `session_id` | `agent_id` | `agent_type` | tool |
+|---|---|---|---|---|
+| PreToolUse | `0311f4f7…` | *absent* | *absent* | `Agent` ← the parent spawning the child |
+| PreToolUse | `0311f4f7…` | `ac76b5442617a9edf` | `Explore` | `Bash` ← **the child's own call** |
+| PostToolUse | `0311f4f7…` | `ac76b5442617a9edf` | `Explore` | `Glob` |
+| SubagentStop | `0311f4f7…` | `ac76b5442617a9edf` | `Explore` | — |
+| PostToolUse | `0311f4f7…` | *absent* | *absent* | `Agent` |
+| Stop | `0311f4f7…` | *absent* | *absent* | — |
+
+Three facts that are easy to get backwards:
+
+1. **A child's tool calls DO reach the spool.** They are not missing, and they are
+   not filed under the child's own id — they carry the parent session's id, and
+   the child is named only by the top-level `agent_id`.
+2. **`agent_id` is absent for the parent's own calls**, including the `Agent` call
+   that spawns the child. So `null` means "the session itself", not "unknown", and
+   a child's work must never be counted as its parent's.
+3. **A background child outlives its parent's turn.** `Stop` says the harness
+   finished answering; it does not say the children are done. Observed live: a
+   `stop` for `b3d712dd…` at 14:39:25 while a child spawned at 14:38 kept working
+   and spooling.
+
+Without `agent_id` on tool events there is no authoritative "this child is still
+working" signal at all — only `subagent_stop`, which can say a child finished but
+never that one resumed. That is why the field was added.
+
+`agent_type` (`Explore`, `general-purpose`, `spark-triage`, …) rides along for a
+smaller reason: a child whose parent spawn record says `agentType: null` — most of
+them — can still be labelled by kind.
 
 ### What never reaches the spool
 
@@ -287,8 +325,11 @@ for f in glob.glob("/root/.local/state/alcove/spool/*.jsonl"):
     for i, line in enumerate(open(f), 1):
         assert len(line.encode()) <= 2048, (f, i)
         d = json.loads(line)
-        assert set(d) == {"v","ts","harness","event","session_id","tool",
-                          "cwd","target","arg","ok","tool_use_id"}, (f, i)
+        # The additive fields are absent on lines written before they existed,
+        # which is why this checks a floor and a ceiling rather than equality.
+        base = {"v","ts","harness","event","session_id","tool",
+                "cwd","target","arg","ok","tool_use_id"}
+        assert base <= set(d) <= base | {"agent_id","agent_type"}, (f, i)
         assert d["event"] in {"pre","post","stop","subagent_stop"}, (f, i)
         assert d["event"] == "post" or d["ok"] is None, (f, i)
         if d["event"] in {"stop","subagent_stop"}:
