@@ -89,9 +89,25 @@ This matters in both directions. A session in a long tool call writes nothing fo
 an hour and looks dead by file age alone, while a finished one-shot run leaves a
 transcript that looks like a session forever. Only the process answers it.
 
-Per subagent — id, role/type, model, running/idle, turns, output/input/cache
-tokens, age, and the task it was given. A session whose subagents run a
-different model than the parent is flagged.
+Per subagent — id, role/type, model, state, turns, output/input/cache tokens,
+age, and the task it was given. A session whose subagents run a different model
+than the parent is flagged.
+
+**Subagent state comes from the harness's own stop events**, when the hooks have
+seen the child (see `hooks/`):
+
+| state | meaning |
+| --- | --- |
+| `running` | a tool call from this child, with no stop after it — authoritative |
+| `stopped HH:MM:SS` | a `SubagentStop` was logged then, and nothing since |
+| `running?` | *inferred* from transcript age; no stop event on record |
+| `idle` | no stop event and no recent write — finished and abandoned look alike |
+
+A stop is a transition, not a tombstone: activity after one means the child
+resumed, and it reads `running` again. Inference is drawn differently on purpose
+— hollow dot, dimmed, trailing `?` — because the bug this replaced was a guess
+that rendered exactly like a fact: a child that finished ten seconds ago kept
+showing as running for the full five-minute window.
 
 Counts are **active / total**, not lifetime only: a session with 2 running out
 of 28 spawned reads `2 active / 28 sub`, and the `active subagents` filter shows
@@ -124,6 +140,15 @@ Codex
 Model authority differs by harness: Claude records `message.model` per assistant
 event; Codex records `model` + `effort` in `turn_context`, and cumulative token
 totals in `token_count`.
+
+```
+Hooks (optional, see hooks/)
+  ~/.local/state/alcove/spool/<harness>-<YYYYMMDD>.jsonl   one line per tool
+      call and per stop event; the only source of authoritative subagent state
+```
+
+The same three roots are watched for changes, which is what makes `/api/events`
+push rather than poll.
 
 ## Config
 
@@ -168,6 +193,19 @@ it. ZeroTier encrypts peer-to-peer; do not put this on an untrusted network.
   systemd, PATH has no nvm directory, `claude` did not resolve, and the failure
   was swallowed, so every session showed no pid and liveness silently degraded
   to file age.
+- **The push path cannot see a process dying.** `/api/events` fires on filesystem
+  writes, and an exiting process writes nothing — so `running` → `ended` still
+  waits for the pid cache (15 s), while everything driven by a transcript or a
+  hook line arrives in well under a second. A bound, not a bug.
+- **State from stop events only covers what the hooks saw.** Two UTC days of spool
+  are read, so a child older than that, or one that ran before the hooks were
+  wired, falls back to the age window and is labelled `running?` / `idle`. Codex
+  is entirely in this bucket today: its hooks are wired but unacknowledged, so
+  every Codex subagent is inferred until someone trusts them in the TUI.
+- **A harness killed mid-turn writes no stop event.** The fold refuses to hold
+  such an agent at `running` forever: once its last activity is older than the
+  live window it hands the question back to inference rather than pinning it
+  green.
 - **`idle` is not the same as `done`.** The parent's launch record says
   `async_launched` for every backgrounded subagent and never flips to
   `completed`, so only the 12% that report `completed` can be called finished.
