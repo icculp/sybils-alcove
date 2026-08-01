@@ -10,6 +10,7 @@ use std::path::{Path, PathBuf};
 
 use serde_json::Value;
 
+use crate::launch::{observe_codex, RawLaunch};
 use crate::model::{
     is_real_model, push_effort, push_model, Compaction, EffortAt, ModelAt, TurnRow, Usage,
 };
@@ -44,6 +45,7 @@ pub struct Scan {
     pub live: bool,
     pub spawn_status: String,
     pub branch: String,
+    pub launches: Vec<RawLaunch>,
 }
 
 pub struct SubAgent {
@@ -59,10 +61,15 @@ pub struct SubAgent {
     pub id: String,
     pub label: String,
     pub model: String,
+    pub timeline: Vec<ModelAt>,
     pub role: String,
     pub turns: i64,
     pub usage: Usage,
     pub task: String,
+    pub parent_id: String,
+    pub depth: usize,
+    pub launches: Vec<RawLaunch>,
+    pub path: PathBuf,
 }
 
 pub struct Session {
@@ -84,6 +91,7 @@ pub struct Session {
     pub compactions: Vec<Compaction>,
     pub subagents: Vec<SubAgent>,
     pub path: PathBuf,
+    pub launches: Vec<RawLaunch>,
 }
 
 #[derive(Clone, Debug, Default, PartialEq)]
@@ -155,6 +163,19 @@ fn merge_turn_rows(prior: &mut Scan, current: &Scan) {
     prior.turns = prior.turn_rows.len() as i64;
 }
 
+fn merge_launches(prior: &mut Scan, current: &Scan) {
+    let mut seen: HashSet<(String, String)> = prior
+        .launches
+        .iter()
+        .map(|launch| (launch.call_id.clone(), launch.launcher.clone()))
+        .collect();
+    for launch in &current.launches {
+        if seen.insert((launch.call_id.clone(), launch.launcher.clone())) {
+            prior.launches.push(launch.clone());
+        }
+    }
+}
+
 fn adopt_current_file(prior: &mut Scan, current: &Scan) {
     prior.path = current.path.clone();
     prior.age_s = current.age_s;
@@ -163,6 +184,32 @@ fn adopt_current_file(prior: &mut Scan, current: &Scan) {
 
 fn has_local_parent(info: &Scan, session_ids: &HashSet<String>) -> bool {
     !info.parent.is_empty() && session_ids.contains(&info.parent)
+}
+
+fn descendants(
+    parent: &str,
+    depth: usize,
+    children: &HashMap<String, Vec<usize>>,
+    merged: &[Scan],
+    seen: &mut HashSet<usize>,
+    out: &mut Vec<(usize, usize)>,
+) {
+    if let Some(indices) = children.get(parent) {
+        for &index in indices {
+            if !seen.insert(index) {
+                continue;
+            }
+            out.push((index, depth));
+            descendants(
+                &merged[index].session_id,
+                depth + 1,
+                children,
+                merged,
+                seen,
+                out,
+            );
+        }
+    }
 }
 
 pub fn scan(path: &Path) -> Scan {
@@ -177,6 +224,7 @@ pub fn scan(path: &Path) -> Scan {
     let mut usage = Usage::default();
     let (mut turns, mut ctx_turns) = (0i64, 0i64);
     let mut compactions: Vec<Compaction> = Vec::new();
+    let mut launches: Vec<RawLaunch> = Vec::new();
     let mut usage_at_compact: Option<Usage> = None;
     let (mut last_ts, mut cwd, mut effort) = (String::new(), String::new(), String::new());
     let (mut role, mut nickname) = (String::new(), String::new());
@@ -227,6 +275,7 @@ pub fn scan(path: &Path) -> Scan {
     }
 
     for event in chronological(tail_events(path), "timestamp") {
+        observe_codex(&event, &mut launches);
         let kind = event.get("type").and_then(Value::as_str).unwrap_or("");
         let payload = event.get("payload");
         let ts = event.get("timestamp").and_then(Value::as_str).unwrap_or("").to_string();
@@ -396,6 +445,7 @@ pub fn scan(path: &Path) -> Scan {
         live: false,
         spawn_status: String::new(),
         branch: String::new(),
+        launches,
         path: path.to_path_buf(),
     }
 }
@@ -489,6 +539,7 @@ pub fn collect(root: &Path, cache: &ScanCache<Scan>) -> Vec<Session> {
                 let prior = &mut merged[at];
                 prior.size += info.size;
                 merge_turn_rows(prior, &info);
+                merge_launches(prior, &info);
                 for m in &info.timeline {
                     if prior.timeline.last().map(|t| &t.model) != Some(&m.model) {
                         prior.timeline.push(m.clone());
@@ -587,7 +638,16 @@ pub fn collect(root: &Path, cache: &ScanCache<Scan>) -> Vec<Session> {
             continue; // rendered under its parent
         }
         let mut subs: Vec<SubAgent> = Vec::new();
-        for &ci in children.get(&info.session_id).unwrap_or(&Vec::new()) {
+        let mut nested = Vec::new();
+        descendants(
+            &info.session_id,
+            1,
+            &children,
+            &merged,
+            &mut HashSet::new(),
+            &mut nested,
+        );
+        for (ci, depth) in nested {
             let child = &merged[ci];
             subs.push(SubAgent {
                 // Codex records no completion in the transcript; the spawn edge is
@@ -606,10 +666,15 @@ pub fn collect(root: &Path, cache: &ScanCache<Scan>) -> Vec<Session> {
                 id: child.session_id.clone(),
                 label: child.session_id.chars().take(12).collect(),
                 model: child.model.clone(),
+                timeline: child.timeline.clone(),
                 role: child.role.clone(),
                 turns: child.turns,
                 usage: child.usage,
                 task: child.nickname.clone(),
+                parent_id: child.parent.clone(),
+                depth,
+                launches: child.launches.clone(),
+                path: child.path.clone(),
             });
         }
         // Running subagents first, then freshest — the same order the session
@@ -646,6 +711,7 @@ pub fn collect(root: &Path, cache: &ScanCache<Scan>) -> Vec<Session> {
             compactions: info.compactions.clone(),
             subagents: subs,
             path: info.path.clone(),
+            launches: info.launches.clone(),
         });
     }
     sessions
@@ -653,11 +719,11 @@ pub fn collect(root: &Path, cache: &ScanCache<Scan>) -> Vec<Session> {
 
 #[cfg(test)]
 mod tests {
-    use std::collections::HashSet;
+    use std::collections::{HashMap, HashSet};
     use std::path::PathBuf;
 
     use super::{
-        adopt_current_file, apply_link_fields, has_local_parent, merge_turn_rows,
+        adopt_current_file, apply_link_fields, descendants, has_local_parent, merge_turn_rows,
         parse_parent_link, remember_parent_link, ParentLink, Scan,
     };
     use crate::model::TurnRow;
@@ -778,5 +844,28 @@ mod tests {
             ..Scan::default()
         };
         assert!(!has_local_parent(&scan, &HashSet::new()));
+    }
+
+    #[test]
+    fn recursive_children_keep_parent_order_and_depth() {
+        let scans = vec![
+            Scan {
+                session_id: "child".into(),
+                parent: "root".into(),
+                ..Scan::default()
+            },
+            Scan {
+                session_id: "grandchild".into(),
+                parent: "child".into(),
+                ..Scan::default()
+            },
+        ];
+        let children = HashMap::from([
+            ("root".into(), vec![0]),
+            ("child".into(), vec![1]),
+        ]);
+        let mut out = Vec::new();
+        descendants("root", 1, &children, &scans, &mut HashSet::new(), &mut out);
+        assert_eq!(out, vec![(0, 1), (1, 2)]);
     }
 }

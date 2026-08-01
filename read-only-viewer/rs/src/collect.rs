@@ -12,6 +12,7 @@ use serde_json::{json, Value};
 
 use crate::cache::ScanCache;
 use crate::config::Config;
+use crate::launch::{self, LaunchAttempt};
 use crate::liveness::{self, Fold};
 use crate::{claude, codex, process, spool};
 
@@ -261,6 +262,7 @@ impl Collector {
         // inference — the two must never render the same.
         let spooled = spool::read_window(&spool::spool_dir(), SPOOL_DAYS, &self.spool_cache);
         let fold = Fold::new(&spooled.calls);
+        let mut agent_launches: Vec<LaunchAttempt> = launch::from_spool(&spooled.calls);
         let now = now_ms();
         let window_ms = (self.cfg.live_window_s * 1000.0) as i64;
 
@@ -271,6 +273,36 @@ impl Collector {
         let mut out: Vec<Value> = Vec::new();
 
         for s in &claude_sessions {
+            agent_launches.extend(launch::scope_raw(
+                &s.launches,
+                "claude",
+                &s.session_id,
+                &s.session_id,
+                "",
+                "",
+            ));
+            for a in &s.subagents {
+                agent_launches.extend(launch::scope_raw(
+                    &a.launches,
+                    "claude",
+                    &s.session_id,
+                    &a.id,
+                    &s.session_id,
+                    &a.role,
+                ));
+                agent_launches.push(launch::native_child(
+                    "claude",
+                    &s.session_id,
+                    &s.session_id,
+                    "",
+                    "",
+                    &a.id,
+                    &a.role,
+                    &a.status,
+                    &a.task,
+                    !a.no_transcript,
+                ));
+            }
             live_paths.push(s.path.clone());
             index.insert(
                 (s.session_id.clone(), String::new()),
@@ -348,6 +380,7 @@ impl Collector {
                         "effort": a.effort, "effort_timeline": a.effort_timeline,
                         "version": a.version, "version_timeline": a.version_timeline,
                         "record_model": a.record_model, "role": role,
+                        "parent_id": s.session_id, "depth": 1,
                         "status": a.status, "turns": a.turns, "usage": a.usage,
                         "reported_tokens": Value::Null, "tool_uses": Value::Null,
                         "task": a.task, "size": a.size,
@@ -405,6 +438,38 @@ impl Collector {
         }
 
         for s in &codex_sessions {
+            agent_launches.extend(launch::scope_raw(
+                &s.launches,
+                "codex",
+                &s.session_id,
+                &s.session_id,
+                "",
+                "",
+            ));
+            for a in &s.subagents {
+                agent_launches.extend(launch::scope_raw(
+                    &a.launches,
+                    "codex",
+                    &s.session_id,
+                    &a.id,
+                    &a.parent_id,
+                    &a.role,
+                ));
+                let caller = if a.parent_id.is_empty() { &s.session_id } else { &a.parent_id };
+                let caller_meta = s.subagents.iter().find(|parent| parent.id == *caller);
+                agent_launches.push(launch::native_child(
+                    "codex",
+                    &s.session_id,
+                    caller,
+                    caller_meta.map(|parent| parent.parent_id.as_str()).unwrap_or(""),
+                    caller_meta.map(|parent| parent.role.as_str()).unwrap_or(""),
+                    &a.id,
+                    &a.role,
+                    &a.status,
+                    &a.task,
+                    true,
+                ));
+            }
             live_paths.push(s.path.clone());
             index.insert(
                 (s.session_id.clone(), String::new()),
@@ -433,11 +498,22 @@ impl Collector {
                         fold.child(&a.id, None, now, window_ms),
                         a.live,
                     );
+                    index.insert(
+                        (s.session_id.clone(), a.id.clone()),
+                        (a.path.clone(), "codex".into(), json!({
+                            "session_id": s.session_id, "agent_id": a.id,
+                            "label": a.label, "model": a.model, "cwd": s.cwd,
+                            "project": s.project, "role": a.role, "task": a.task,
+                            "state": if sub_state == "running" { "running" } else { "" },
+                        })),
+                    );
+                    live_paths.push(a.path.clone());
                     json!({
                         "id": a.id, "label": a.label, "model": a.model,
                         "effort": a.effort, "effort_timeline": a.effort_timeline,
                         "version": a.version, "version_timeline": Vec::<Value>::new(),
                         "record_model": "", "role": a.role, "status": a.status,
+                        "parent_id": a.parent_id, "depth": a.depth,
                         "nickname": a.nickname,
                         "turns": a.turns, "usage": a.usage,
                         "reported_tokens": if a.usage.output > 0 {
@@ -450,7 +526,7 @@ impl Collector {
                         "live": sub_state == "running",
                         "state": sub_state, "stopped_at": stopped_at,
                         "inferred": inferred,
-                        "no_transcript": false, "timeline": Vec::<Value>::new(),
+                        "no_transcript": false, "timeline": a.timeline,
                         "turn_rows": a.turn_rows,
                     })
                 })
@@ -489,6 +565,27 @@ impl Collector {
             ka.cmp(&kb).then(aa.partial_cmp(&ab).unwrap_or(std::cmp::Ordering::Equal))
         });
 
+        let mut launch_by_id: std::collections::HashMap<String, LaunchAttempt> =
+            std::collections::HashMap::new();
+        for launch in agent_launches {
+            match launch_by_id.entry(launch.id.clone()) {
+                std::collections::hash_map::Entry::Vacant(slot) => {
+                    slot.insert(launch);
+                }
+                std::collections::hash_map::Entry::Occupied(mut slot) => {
+                    let prior = slot.get_mut();
+                    if prior.status == "attempted" && launch.status != "attempted" {
+                        prior.status = launch.status;
+                    }
+                    if prior.at.is_empty() {
+                        prior.at = launch.at;
+                    }
+                }
+            }
+        }
+        let mut agent_launches: Vec<LaunchAttempt> = launch_by_id.into_values().collect();
+        agent_launches.sort_by(|a, b| b.at.cmp(&a.at).then(a.id.cmp(&b.id)));
+
         // Drop cache entries for transcripts that no longer exist.
         if let Ok(mut guard) = self.paths.lock() {
             *guard = index;
@@ -521,6 +618,7 @@ impl Collector {
                 "subagents_covered": fold.children_covered(),
                 "cache": {"hits": sh, "misses": sm},
             },
+            "agent_launches": agent_launches,
             "sessions": out,
         })
     }

@@ -278,6 +278,7 @@ mod tests {
             tool_use_id: None,
             agent_id: if event == "subagent_stop" { None } else { agent.map(|a| a.into()) },
             agent_type: agent.map(|_| "Explore".into()),
+            agent_launchers: Vec::new(),
         }
     }
 

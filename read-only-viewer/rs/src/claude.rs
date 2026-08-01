@@ -13,6 +13,7 @@ use std::path::{Path, PathBuf};
 use regex::Regex;
 use serde_json::Value;
 
+use crate::launch::{observe_claude, RawLaunch};
 use crate::model::{
     event_effort, event_text, is_real_model, push_effort, push_model, push_selection,
     push_version, Compaction, EffortAt, ModelAt, Selection, TurnRow, Usage, VersionAt,
@@ -39,6 +40,7 @@ pub struct Scan {
     pub compactions: Vec<Compaction>,
     pub usage_since_compact: Option<Usage>,
     pub turns_since_compact: Option<i64>,
+    pub launches: Vec<RawLaunch>,
 }
 
 pub struct SubAgent {
@@ -62,6 +64,7 @@ pub struct SubAgent {
     /// it is directly comparable with a spool `ts` — which mtime is not, and
     /// which is the whole reason it is carried out of the scan.
     pub last_ts: String,
+    pub launches: Vec<RawLaunch>,
 }
 
 pub struct Session {
@@ -85,6 +88,7 @@ pub struct Session {
     pub compactions: Vec<Compaction>,
     pub subagents: Vec<SubAgent>,
     pub path: PathBuf,
+    pub launches: Vec<RawLaunch>,
 }
 
 struct Res {
@@ -130,11 +134,13 @@ pub fn scan(path: &Path, main_thread_only: bool) -> Scan {
     let mut seen_msgs: HashSet<String> = HashSet::new();
     let (mut turns, mut ctx_turns) = (0i64, 0i64);
     let mut compactions: Vec<Compaction> = Vec::new();
+    let mut launches: Vec<RawLaunch> = Vec::new();
     let (mut last_ts, mut cwd, mut branch, mut effort) =
         (String::new(), String::new(), String::new(), String::new());
     let mut version = String::new();
 
     for event in chronological(tail_events(path), "timestamp") {
+        observe_claude(&event, &mut launches);
         if cwd.is_empty() {
             if let Some(v) = event.get("cwd").and_then(Value::as_str) {
                 cwd = v.to_string();
@@ -308,6 +314,7 @@ pub fn scan(path: &Path, main_thread_only: bool) -> Scan {
         compactions,
         usage_since_compact: if has_compactions { Some(ctx_usage) } else { None },
         turns_since_compact: if has_compactions { Some(ctx_turns) } else { None },
+        launches,
     }
 }
 
@@ -430,6 +437,7 @@ pub fn collect(root: &Path, cache: &ScanCache<Scan>) -> Vec<Session> {
                         size: file_size(&child),
                         no_transcript: false,
                         last_ts: child_info.last_ts.clone(),
+                        launches: child_info.launches.clone(),
                         id: agent_id,
                     });
                 }
@@ -459,6 +467,7 @@ pub fn collect(root: &Path, cache: &ScanCache<Scan>) -> Vec<Session> {
                     size: 0,
                     no_transcript: true,
                     last_ts: String::new(),
+                    launches: Vec::new(),
                 });
             }
 
@@ -483,6 +492,7 @@ pub fn collect(root: &Path, cache: &ScanCache<Scan>) -> Vec<Session> {
                 compactions: info.compactions,
                 subagents: subs,
                 path: transcript,
+                launches: info.launches,
             });
         }
     }

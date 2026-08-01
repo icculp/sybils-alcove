@@ -32,6 +32,7 @@ written with a single `O_APPEND` `write()` of at most **2048 bytes**.
 | `tool_use_id` | str \| null | the harness's own id for the call; `null` on stop-family events |
 | `agent_id` | str \| null | WHICH agent acted: a child's id, or `null` for the session's own turn |
 | `agent_type` | str \| null | that child's kind (`Explore`, `general-purpose`, …) |
+| `agent_launchers` | list[str] | agent executables/native roles classified without retaining their command or prompt |
 
 `agent_id` / `agent_type` were **added without bumping `v`**, and that is the
 point: they are nullable and additive, an old line means exactly what a `null`
@@ -181,7 +182,9 @@ or prompt bodies.
 - **Codex `custom_tool_call` payloads carry a bare string, not an object.** For
   `apply_patch` the hook lifts only the `*** Add File: <path>` header line — never
   a byte of the patch body. For `exec` (a raw script body) both `target` and
-  `arg` are `null` by design.
+  `arg` are `null` by design. The hook separately classifies only values passed
+  to `cmd:`/`command:` into `agent_launchers`; this preserves a launch fact
+  without spooling the script or agent prompt.
 - Latency is dominated by CPython process startup, not by the hook. On this host
   `python3 -c pass` alone is ~11 ms median / ~26 ms p95; the full hook is
   **~24.5 ms median, ~42.5 ms p95, 54.6 ms max over 100 runs** on a real

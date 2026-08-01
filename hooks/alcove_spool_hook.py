@@ -171,6 +171,164 @@ def _extract(tool_input):
     return None, None
 
 
+def _command_launchers(command, depth=0):
+    """Classify agent executables, including commands nested under a shell."""
+    import os
+    import re
+    import shlex
+
+    if depth > 4:
+        return []
+
+    wrappers = {"env", "sudo", "command", "nohup", "setsid", "timeout", "!"}
+    segments = []
+    current = []
+    quote = None
+    escaped = False
+    for char in command:
+        if escaped:
+            current.append(char)
+            escaped = False
+        elif char == "\\":
+            current.append(char)
+            escaped = True
+        elif quote:
+            current.append(char)
+            if char == quote:
+                quote = None
+        elif char in "'\"`":
+            current.append(char)
+            quote = char
+        elif char in ";&|\n":
+            if "".join(current).strip():
+                segments.append("".join(current))
+            current = []
+        else:
+            current.append(char)
+    if "".join(current).strip():
+        segments.append("".join(current))
+
+    out = []
+    for segment in segments:
+        try:
+            tokens = shlex.split(segment)
+        except ValueError:
+            tokens = segment.split()
+        for i, raw in enumerate(tokens):
+            token = raw.strip("'\"`(){}")
+            if (
+                not token
+                or token in wrappers
+                or token.startswith("-")
+                or "=" in token
+                or re.fullmatch(r"[0-9.]+[smh]?", token)
+            ):
+                continue
+            base = os.path.basename(token).lower()
+            rest = [part.strip("'\"`(){}") for part in tokens[i + 1 :]]
+            if base in ("bash", "sh", "zsh", "dash"):
+                for index, part in enumerate(rest):
+                    if part.startswith("-") and "c" in part and index + 1 < len(rest):
+                        for launcher in _command_launchers(rest[index + 1], depth + 1):
+                            if launcher not in out:
+                                out.append(launcher)
+                        break
+                break
+            launcher = None
+            if "codex-spark-triage" in base:
+                launcher = "spark"
+            elif base == "codex" or base.startswith("codex-") or base.endswith("-codex"):
+                if base != "codex" or (rest and rest[0] in ("exec", "review")):
+                    launcher = "codex"
+            elif base == "claude" or "claude-agent" in base:
+                if not any(part in ("--version", "agents", "mcp") for part in rest):
+                    launcher = "claude"
+            elif base == "hermes" or "hermes-agent" in base:
+                launcher = "hermes"
+            elif base in ("opencode", "aider") or "luna-agent" in base:
+                launcher = base
+            if launcher and launcher not in out:
+                out.append(launcher)
+            break
+    return out
+
+
+def _agent_launchers(tool, tool_input):
+    """Return launcher names without retaining a command body or agent prompt."""
+    import json
+    import re
+
+    if tool in ("Agent", "Task") or "spawn_agent" in tool.lower():
+        if isinstance(tool_input, dict):
+            role = tool_input.get("subagent_type") or tool_input.get("agent_type")
+            if isinstance(role, str) and role.strip():
+                return [role.strip()[:MAX_FIELD]]
+        return ["native agent"]
+
+    if tool not in ("exec", "functions.exec", "exec_command", "Bash", "bash", "shell"):
+        return []
+
+    candidates = []
+    if isinstance(tool_input, dict):
+        for key in ("cmd", "command"):
+            value = tool_input.get(key)
+            if isinstance(value, list):
+                value = " ".join(str(part) for part in value)
+            if isinstance(value, str):
+                candidates.append(value)
+    elif isinstance(tool_input, str):
+        # Custom Codex exec is JavaScript. Mask string literals, then consider
+        # only values passed to `cmd:`/`command:`. This excludes command examples
+        # inside patch bodies and other data strings.
+        matches = list(
+            re.finditer(
+                r'''(?s)"(?:\\.|[^"\\])*"|'(?:\\.|[^'\\])*'|`(?:\\.|[^`\\])*`''',
+                tool_input,
+            )
+        )
+        literals = {}
+        masked = []
+        end = 0
+        for index, match in enumerate(matches):
+            masked.append(tool_input[end : match.start()])
+            marker = "__ALCOVE_STR_%d__" % index
+            masked.append(marker)
+            raw = match.group(0)
+            if raw.startswith('"'):
+                try:
+                    literals[marker] = json.loads(raw)
+                except Exception:
+                    literals[marker] = ""
+            else:
+                literals[marker] = raw[1:-1].replace("\\n", "\n")
+            end = match.end()
+        masked.append(tool_input[end:])
+        masked = "".join(masked)
+        variables = {}
+        for match in re.finditer(
+            r"\b(?:const|let|var)\s+([A-Za-z_$][A-Za-z0-9_$]*)\s*=\s*(__ALCOVE_STR_[0-9]+__)",
+            masked,
+        ):
+            variables[match.group(1)] = literals.get(match.group(2), "")
+        for match in re.finditer(
+            r"\b(?:cmd|command)\s*:\s*([A-Za-z_$][A-Za-z0-9_$]*|__ALCOVE_STR_[0-9]+__)",
+            masked,
+        ):
+            token = match.group(1)
+            value = literals.get(token, variables.get(token))
+            if value:
+                candidates.append(value)
+
+    out = []
+    for command in candidates:
+        for launcher in _command_launchers(command):
+            if launcher not in out:
+                out.append(launcher)
+            if len(out) == 8:
+                return out
+    return out
+
+
 def _determine_ok(payload):
     """post events only. None means "not cheaply determinable" -- which is a
     different answer from False, and must stay different.
@@ -283,6 +441,10 @@ def main():
         # null here means "the session itself", not "unknown".
         "agent_id": _str(payload.get("agent_id"), MAX_FIELD),
         "agent_type": _str(payload.get("agent_type"), MAX_FIELD),
+        # This is the durable fact the child transcript cannot provide when a
+        # launcher is wrapped, fails, or uses ephemeral storage. Names only: the
+        # command and prompt remain subject to the stricter arg whitelist above.
+        "agent_launchers": _agent_launchers(tool, payload.get("tool_input")),
     }
 
     def encode(rec):
