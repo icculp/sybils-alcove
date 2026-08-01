@@ -25,6 +25,27 @@ function args(value) {
   }).join('  ');
 }
 
+// A spawn's parameters, pulled to the front of the row: which model a subagent
+// was handed is the governance question, and in the raw argument list it sits
+// next to a prompt thousands of characters long. Order is fixed here rather
+// than taken from the object so two spawns line up when read down the column.
+//
+// This is a SUMMARY — the full arguments still render to its right. A false
+// boolean shows nothing because false is the default for both of these and a
+// row of `no-bg` markers would bury the ones that matter; the argument list
+// beside it still says `run_in_background=false`. Absent shows nothing at all.
+const PARAM_ORDER = ['model', 'subagent_type', 'agent_type', 'effort',
+                     'reasoning_effort', 'isolation'];
+const PARAM_FLAGS = {run_in_background: 'bg', fork_context: 'fork'};
+
+function spawnParams(p) {
+  if (!p || typeof p !== 'object') return '';
+  const bits = [];
+  for (const k of PARAM_ORDER) if (p[k]) bits.push(String(p[k]));
+  for (const [k, label] of Object.entries(PARAM_FLAGS)) if (p[k] === true) bits.push(label);
+  return bits.length ? `<span class="spawn">${esc(bits.join(' · '))}</span>` : '';
+}
+
 const LABEL = {assistant: 'says', user: 'user', tool_use: 'calls',
                tool_result: 'result', reasoning: 'thinks', compact: 'compact'};
 
@@ -43,7 +64,7 @@ function row(e) {
   const cut = e.truncated ? '<span class="cut">TRUNCATED</span>' : '';
   let body;
   if (e.kind === 'tool_use') {
-    body = `<div class="tool"><b>${esc(e.name)}</b>`
+    body = `<div class="tool"><b>${esc(e.name)}</b>${spawnParams(e.params)}`
          + `<span class="args">${args(e.args)}</span></div>`;
   } else if (e.kind === 'reasoning') {
     // Never render this as empty text — see the note in the header.

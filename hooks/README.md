@@ -33,6 +33,7 @@ written with a single `O_APPEND` `write()` of at most **2048 bytes**.
 | `agent_id` | str \| null | WHICH agent acted: a child's id, or `null` for the session's own turn |
 | `agent_type` | str \| null | that child's kind (`Explore`, `general-purpose`, …) |
 | `agent_launchers` | list[str] | agent executables/native roles classified without retaining their command or prompt |
+| `params` | object | **spawn calls only, absent otherwise**: the whitelisted parameters of an agent launch — `model` above all. Never the prompt. Serialized form capped at 300 chars |
 
 `agent_id` / `agent_type` were **added without bumping `v`**, and that is the
 point: they are nullable and additive, an old line means exactly what a `null`
@@ -131,6 +132,64 @@ never that one resumed. That is why the field was added.
 smaller reason: a child whose parent spawn record says `agentType: null` — most of
 them — can still be labelled by kind.
 
+#### `params`: what a spawn was actually asked for (verified per harness)
+
+`arg` on a spawn line carries the description and nothing else, so until this
+existed the spool recorded *that* an agent was launched and never *what it was
+given* — and **which model a subagent ran is the single most governance-relevant
+parameter of a launch**. `params` carries a whitelist of it, on spawn lines only:
+
+| key | harness | |
+|---|---|---|
+| `model` | both | the child's model. **Absent when the caller did not name one** |
+| `subagent_type` | claude | `Explore`, `general-purpose`, … |
+| `agent_type` | codex | `default`, `explorer`, `worker` |
+| `effort` / `reasoning_effort` | claude / codex | the same fact, two spellings |
+| `run_in_background` | claude | a background child outlives its parent's turn |
+| `isolation` | claude | `worktree` / `remote` |
+| `fork_context` | codex | whether the child inherited the parent's history |
+
+Spawn tools are `Agent` and `Task` on Claude and anything containing
+`spawn_agent` on Codex (the tool namespace is sometimes prefixed, as in
+`multi_agent_v1spawn_agent`). The other `multi_agent_v1*` tools act on an agent
+that already exists and carry no spawn parameters, so they get no `params`.
+
+Captured payloads, prompt bodies elided — read off real runs, not a schema:
+
+```jsonc
+// Claude Code 2.1.208, PreToolUse, tool_name "Agent", model NAMED by the caller
+"tool_input": {"description":"List files in hooks/ directory","prompt":"…",
+               "subagent_type":"Explore","model":"haiku","run_in_background":false}
+// the same harness, same tool, model NOT named — there is no `model` key at all
+"tool_input": {"description":"List files in /tmp","prompt":"…",
+               "subagent_type":"Explore","run_in_background":false}
+// Codex 0.146.0 spawn_agent arguments
+{"agent_type":"default","fork_context":false,"model":"gpt-5.5",
+ "reasoning_effort":"xhigh","service_tier":"priority","message":"…"}
+```
+
+Three consequences worth stating rather than rediscovering:
+
+1. **An absent `model` means the caller did not choose one**, not that the child
+   ran the default. The harness resolves the default after the hook has seen the
+   payload, so the spool cannot know what it resolved to and does not guess.
+2. **`params` is absent, never `{}`**, on a non-spawn line, on a spawn that named
+   none of these, and on every line written before the field existed. Additive
+   and nullable, so `v` stays `1` for the same reason `agent_id` did.
+3. The serialized object is capped at **300 chars**, and the cap is applied by
+   DROPPING whole keys in the table's order rather than clipping the JSON — a
+   truncated object is unparseable, and half a parameter set beats none. Every
+   value is an enum, a bool or a model name, so this cap has never bitten;
+   it exists so a future harness passing a long free-form value cannot push the
+   line toward the 2048-byte limit.
+
+`prompt` (Claude) and `message` (Codex) are the task body and are **never**
+spooled — the keys are a whitelist, so a parameter added by a future release
+cannot leak a body in by being unrecognised. The credential scrub is deliberately
+NOT applied to these values: they are harness enums and model names rather than
+user text, and the scrub would eat any of them containing `session`, `key` or
+`auth`. Same reasoning as the stop-family ids.
+
 ### What never reaches the spool
 
 No `tool_response` body, no environment variables, no file contents, no message
@@ -143,7 +202,8 @@ or prompt bodies.
   `file_path`, `notebook_path`, `path`, `filePath`, `description`. So `Write`
   spools its `file_path` and never its `content`; `Edit` never spools
   `old_string`/`new_string`; `Agent` spools its `description` and never its
-  `prompt`; `mcp__hindsight__retain` never spools its `content`.
+  `prompt`; `mcp__hindsight__retain` never spools its `content`. `params` is a
+  second, separate whitelist over the same `tool_input` — see above.
 - `tool_response` is inspected for failure *markers* only (`is_error`,
   `interrupted`, `exit_code`, …). Its values are never copied out — a truthy
   `error` sets `ok: false` and the message is discarded.
@@ -332,11 +392,18 @@ for f in glob.glob("/root/.local/state/alcove/spool/*.jsonl"):
         # which is why this checks a floor and a ceiling rather than equality.
         base = {"v","ts","harness","event","session_id","tool",
                 "cwd","target","arg","ok","tool_use_id"}
-        assert base <= set(d) <= base | {"agent_id","agent_type"}, (f, i)
+        added = {"agent_id","agent_type","agent_launchers","params"}
+        assert base <= set(d) <= base | added, (f, i)
         assert d["event"] in {"pre","post","stop","subagent_stop"}, (f, i)
         assert d["event"] == "post" or d["ok"] is None, (f, i)
         if d["event"] in {"stop","subagent_stop"}:
             assert d["tool"] == "" and d["tool_use_id"] is None, (f, i)
+        # params is a spawn-only field, is never empty when present, and never
+        # carries a body.
+        if "params" in d:
+            assert d["tool"] in ("Agent","Task") or "spawn_agent" in d["tool"], (f, i)
+            assert d["params"] and len(json.dumps(d["params"])) <= 300, (f, i)
+            assert not ({"prompt","message","description"} & set(d["params"])), (f, i)
 print("ok")
 PY
 ```

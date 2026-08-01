@@ -31,6 +31,11 @@ body.wrap .ev .c pre{white-space:pre-wrap;overflow-wrap:anywhere}
 
 .tool{display:flex;gap:8px;align-items:baseline;flex-wrap:wrap}
 .tool b{color:var(--sub);font-weight:600}
+/* A spawn's parameters read as a badge, not as another argument: which model a
+   child was handed is the one thing on that row worth finding at a glance. Only
+   a spawn has one, so it never competes for attention on an ordinary call. */
+.tool .spawn{color:var(--acc);border:1px solid var(--line);border-radius:3px;
+  padding:0 5px;font-size:11px;white-space:nowrap}
 .args{color:var(--dim);min-width:0;overflow-x:auto;white-space:pre}
 .ev .cut{color:var(--warn);font-size:10px;letter-spacing:.4px;margin-left:6px}
 

@@ -57,6 +57,59 @@ fn shrink(value: &Value, depth: usize) -> Value {
     }
 }
 
+/// Spawn parameters worth pulling to the front of a row, and the ONLY keys
+/// lifted out of a spawn's arguments. Same whitelist the hook spools into
+/// `params` (see `hooks/README.md`); kept in step with it by hand, because the
+/// two read different inputs — the hook reads the live payload, this reads the
+/// transcript the harness wrote afterwards.
+const SPAWN_PARAM_KEYS: [&str; 8] = [
+    "model",
+    "subagent_type",
+    "agent_type",
+    "effort",
+    "reasoning_effort",
+    "run_in_background",
+    "isolation",
+    "fork_context",
+];
+
+/// Is this tool call a spawn? `Agent`/`Task` on Claude, `spawn_agent` on Codex
+/// — where the tool namespace is sometimes prefixed, hence the substring test.
+fn is_spawn(name: &str) -> bool {
+    name == "Agent" || name == "Task" || name.to_lowercase().contains("spawn_agent")
+}
+
+/// The whitelisted parameters of a spawn, or `None` for any other call.
+///
+/// Which model a subagent was given is the most governance-relevant fact about
+/// a launch, and in a spawn's raw arguments it sits next to a prompt that is
+/// three orders of magnitude longer — so it is lifted out and rendered up
+/// front. `None` when the call is not a spawn or named none of these; the page
+/// then renders nothing, never a guessed default. The arguments themselves are
+/// still shown in full underneath, so this is a summary and not a replacement.
+fn spawn_params(name: &str, input: Option<&Value>) -> Option<Value> {
+    if !is_spawn(name) {
+        return None;
+    }
+    let map = input?.as_object()?;
+    let mut out = Map::new();
+    for key in SPAWN_PARAM_KEYS {
+        match map.get(key) {
+            // A body can never arrive here — the keys are a whitelist — but an
+            // object or array value would still be noise in a one-line summary.
+            Some(v) if v.is_string() || v.is_boolean() || v.is_number() => {
+                out.insert(key.to_string(), shrink(v, 3));
+            }
+            _ => {}
+        }
+    }
+    if out.is_empty() {
+        None
+    } else {
+        Some(Value::Object(out))
+    }
+}
+
 /// Seconds since the epoch from an ISO-8601 timestamp, or None.
 ///
 /// Hand-rolled rather than pulling in a date crate: the only shape written by
@@ -180,8 +233,12 @@ fn spill_claude(path: &Path) -> Vec<Value> {
                 }
                 Some("tool_use") => {
                     let mut e = event("tool_use", &ts);
-                    e.insert("name".into(), json!(obj.get("name").and_then(Value::as_str).unwrap_or("")));
+                    let name = obj.get("name").and_then(Value::as_str).unwrap_or("");
+                    e.insert("name".into(), json!(name));
                     e.insert("tool_id".into(), json!(obj.get("id").and_then(Value::as_str).unwrap_or("")));
+                    if let Some(params) = spawn_params(name, obj.get("input")) {
+                        e.insert("params".into(), params);
+                    }
                     e.insert("args".into(), shrink(obj.get("input").unwrap_or(&Value::Null), 0));
                     e.insert("model".into(), json!(model));
                     e.insert("effort".into(), json!(effort));
@@ -282,6 +339,9 @@ fn spill_codex(path: &Path) -> Vec<Value> {
                 let name = payload.get("name").and_then(Value::as_str).unwrap_or(ptype);
                 e.insert("name".into(), json!(name));
                 e.insert("tool_id".into(), json!(payload.get("call_id").and_then(Value::as_str).unwrap_or("")));
+                if let Some(params) = spawn_params(name, Some(&args)) {
+                    e.insert("params".into(), params);
+                }
                 e.insert("args".into(), shrink(&args, 0));
                 out.push(Value::Object(e));
             }
@@ -371,4 +431,47 @@ pub fn spill(
         // these are the last events in the file, not the whole session.
         "tail_bounded": true,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The Claude shape is verbatim from a captured PreToolUse payload; the
+    /// Codex one from a real `spawn_agent` function_call in a rollout. Both had
+    /// their prompt/message bodies elided, which is the point of the whitelist.
+    #[test]
+    fn a_spawn_lifts_its_parameters_and_never_its_prompt() {
+        let claude = json!({
+            "description": "List files in hooks/ directory",
+            "prompt": "a task body thousands of characters long",
+            "subagent_type": "Explore", "model": "haiku", "run_in_background": false
+        });
+        let got = spawn_params("Agent", Some(&claude)).expect("a spawn has params");
+        assert_eq!(got["model"], "haiku");
+        assert_eq!(got["subagent_type"], "Explore");
+        assert_eq!(got["run_in_background"], false);
+        assert!(got.get("prompt").is_none() && got.get("description").is_none());
+
+        let codex = json!({
+            "agent_type": "default", "fork_context": false, "model": "gpt-5.5",
+            "reasoning_effort": "xhigh", "service_tier": "priority",
+            "message": "a task body"
+        });
+        let got = spawn_params("spawn_agent", Some(&codex)).unwrap();
+        assert_eq!(got["model"], "gpt-5.5");
+        assert_eq!(got["reasoning_effort"], "xhigh");
+        assert!(got.get("message").is_none());
+    }
+
+    #[test]
+    fn a_call_that_is_not_a_spawn_has_none() {
+        // `model` on some other tool is not a spawn parameter, and an agent tool
+        // that operates on an existing child is not a spawn either.
+        assert!(spawn_params("Bash", Some(&json!({"command": "ls", "model": "haiku"}))).is_none());
+        assert!(spawn_params("multi_agent_v1wait_agent", Some(&json!({"agent_id": "a"}))).is_none());
+        // A spawn that named nothing renders as absent, never as a default.
+        assert!(spawn_params("Task", Some(&json!({"prompt": "p"}))).is_none());
+        assert!(spawn_params("Agent", None).is_none());
+    }
 }
