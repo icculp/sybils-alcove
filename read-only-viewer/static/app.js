@@ -184,18 +184,23 @@ function subTable(subs, sid){
         + '<th></th></tr>';
   for(const s of subs){
     const mism = s.record_model && s.model && s.record_model !== s.model;
+    const modelTrace = (s.timeline||[]).map(x=>x.model).filter((x,i,a)=>!i||x!==a[i-1]);
     // Hollow ring for an inferred "running", filled for one the harness
     // confirmed — the same treatment a quiet session already gets.
     const dot = s.state === 'running' ? (s.inferred ? 'live quiet' : 'live') : 'idle';
+    const depth = Math.max(1, s.depth || 1);
     h += '<tr>'
-      + '<td><span class="dot '+dot+'" '
+      + '<td style="padding-left:'+(12+(depth-1)*18)+'px">'
+      + (depth>1?'<span class="muted" title="child of '+esc(s.parent_id)+'">&#8627;</span> ':'')
+      + '<span class="dot '+dot+'" '
       +   'style="display:inline-block;margin-right:6px"></span><code'
       +   (s.version?' title="harness '+esc(s.version)+'"':'')+'>'+esc(s.label)+'</code>'
       +   (s.nickname?' <span class="nm">'+esc(s.nickname)+'</span>':'')+'</td>'
       + '<td class="muted">'+esc(s.role||'—')+'</td>'
       + '<td><span class="model sm">'+esc(s.model||'unknown')+'</span>'
       +   (mism?' <span class="pill warn">rec '+esc(s.record_model)+'</span>':'')
-      +   (s.timeline&&s.timeline.length>1?' <span class="pill warn">'+(s.timeline.length-1)+' sw</span>':'')+'</td>'
+      +   (modelTrace.length>1?' <span class="pill warn" title="served: '
+          +esc(modelTrace.join(' -> '))+'">'+esc(modelTrace[0])+' -> '+esc(modelTrace.at(-1))+'</span>':'')+'</td>'
       // A child transcript records its own effort. Em dash where it does not:
       // "not recorded" and "low" must not look the same.
       + '<td>'+(s.effort?'<span class="eff">'+esc(s.effort)+'</span>'
@@ -212,6 +217,31 @@ function subTable(subs, sid){
       + '<td>'+(s.no_transcript?'':spillLink(sid, s.id))+'</td></tr>';
   }
   return h + '</table>';
+}
+
+function launchTable(launches){
+  if(!launches || !launches.length) return '';
+  let h = '<section class="ledger"><h2>AGENT LAUNCH LEDGER <span class="muted">'
+    +launches.length+'</span></h2><table><tr><th>time</th><th>caller</th>'
+    +'<th>launcher</th><th>kind</th><th>status</th><th>child</th>'
+    +'<th>evidence</th><th>task</th></tr>';
+  for(const x of launches){
+    const nested = x.caller_parent_id && x.caller_parent_id !== x.caller_id;
+    h += '<tr>'
+      +'<td class="muted">'+(x.at?HHMM(x.at):'—')+'</td>'
+      +'<td>'+(nested?'<span class="muted" title="parent '+esc(x.caller_parent_id)+'">&#8627;</span> ':'')
+      +'<code>'+esc((x.caller_id||x.session_id).slice(0,13))+'</code>'
+      +(x.caller_role?' <span class="nm">'+esc(x.caller_role)+'</span>':'')+'</td>'
+      +'<td><span class="model sm">'+esc(x.launcher)+'</span></td>'
+      +'<td class="muted">'+esc(x.kind)+'</td>'
+      +'<td>'+('<span class="'+(x.status==='failed'?'warnx':'muted')+'">'
+        +esc(x.status||'observed')+'</span>')+'</td>'
+      +'<td>'+(x.child_id?'<code>'+esc(x.child_id.slice(0,13))+'</code>':'—')+'</td>'
+      +'<td>'+(x.transcript?'<span class="pill on">transcript</span>'
+        :'<span class="pill warn">invocation only</span>')+'</td>'
+      +'<td class="t">'+esc(x.task||'')+'</td></tr>';
+  }
+  return h+'</table></section>';
 }
 
 let last = '';
@@ -236,10 +266,11 @@ function render(d){
     esc(d.generated_at)+' · <b>'+busy+' running</b>'
     +(quiet?' <span class="muted">(+'+quiet+' quiet)</span>':'')+' / '+liveN+' writing / '
     +d.sessions.length+' transcripts · '+subsLive+' active / '+subs+' subagents'
+    +' · '+((d.agent_launches||[]).length)+' launches'
     +(d.codex_processes!=null?' · '+d.codex_processes+' codex proc':'')
     +(bad?' · <span class="warnx">pid lookup '+esc(d.pid_source)+'</span>':'');
 
-  let h = '';
+  let h = launchTable(d.agent_launches||[]);
   for(const s of list){
     const models = new Set(s.subagents.filter(x=>x.model).map(x=>x.model));
     const mixed = s.model && [...models].some(m => m !== s.model);

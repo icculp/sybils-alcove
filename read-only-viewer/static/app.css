@@ -8,10 +8,14 @@ font:13px/1.5 ui-monospace,SFMono-Regular,Menlo,monospace}
 header{position:sticky;top:0;background:var(--panel);border-bottom:1px solid var(--line);
 padding:10px 14px;display:flex;gap:14px;align-items:center;flex-wrap:wrap;z-index:5}
 h1{font-size:14px;margin:0;letter-spacing:1px;font-weight:600}
+h2{font-size:11px;margin:0;padding:8px 12px;letter-spacing:1px;font-weight:600}
 .muted{color:var(--dim)}
 .wrap{padding:14px;max-width:1600px}
 .s{background:var(--panel);border:1px solid var(--line);border-radius:6px;
 margin-bottom:10px;overflow:hidden}
+.ledger{margin-bottom:14px;border-top:1px solid var(--line);border-bottom:1px solid var(--line);
+overflow-x:auto}
+.ledger table{min-width:1040px}
 .shead{padding:9px 12px;display:flex;gap:10px;align-items:baseline;flex-wrap:wrap;
 cursor:pointer;user-select:none}
 .s.open .shead{border-bottom:1px solid var(--line)}

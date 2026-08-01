@@ -93,6 +93,13 @@ Per subagent — id, role/type, model, state, turns, output/input/cache tokens,
 age, and the task it was given. A session whose subagents run a different model
 than the parent is flagged.
 
+The **agent launch ledger** is independent of those child rows. It records the
+caller's durable tool-call evidence for native, wrapped, failed, and nested
+launch attempts even when no child transcript exists. A retained child is
+reconciled as `transcript`; a call with no retained child remains visibly
+`invocation only`. Codex descendants are flattened with their immediate parent
+and depth, so grandchildren do not disappear beneath a one-level table.
+
 **Subagent state comes from the harness's own stop events**, when the hooks have
 seen the child (see `hooks/`):
 
@@ -203,6 +210,12 @@ it. ZeroTier encrypts peer-to-peer; do not put this on an untrusted network.
   wired, falls back to the age window and is labelled `running?` / `idle`. Codex
   is entirely in this bucket today: its hooks are wired but unacknowledged, so
   every Codex subagent is inferred until someone trusts them in the TUI.
+- **Launch classification covers native spawn tools, compound commands, shell
+  wrappers such as `bash -lc`, and known local agent executables.** It reads only
+  commands actually passed to a shell tool; examples inside patches and search
+  arguments are excluded. A wrapper whose executable name and nested command
+  carry no agent identity cannot be classified from a command record alone, but
+  the raw tool call still remains in spillout/activity.
 - **A harness killed mid-turn writes no stop event.** The fold refuses to hold
   such an agent at `running` forever: once its last activity is older than the
   live window it hands the question back to inference rather than pinning it

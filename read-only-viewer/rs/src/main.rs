@@ -19,6 +19,7 @@ mod collect;
 mod config;
 mod events;
 mod liveness;
+mod launch;
 mod model;
 mod par;
 mod process;

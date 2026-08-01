@@ -90,6 +90,10 @@ pub struct ToolCall {
     /// exists.
     #[serde(default)]
     pub agent_type: Option<String>,
+    /// Agent launchers classified by the hook without retaining the command or
+    /// prompt that named them. Additive: old lines parse as an empty list.
+    #[serde(default)]
+    pub agent_launchers: Vec<String>,
 }
 
 /// FNV-1a, 128-bit. Hand-rolled rather than pulling in a hash crate, and NOT
@@ -285,6 +289,10 @@ pub fn read_window(dir: &Path, days: i64, cache: &SpoolCache) -> SpoolRead {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs() as i64)
         .unwrap_or(0);
+    read_window_at(dir, days, cache, now)
+}
+
+fn read_window_at(dir: &Path, days: i64, cache: &SpoolCache, now: i64) -> SpoolRead {
     let stamps = recent_stamps(now, days);
     let mut out = SpoolRead { dir: dir.to_path_buf(), ..Default::default() };
     let entries = match std::fs::read_dir(dir) {
@@ -466,6 +474,14 @@ mod tests {
         assert_eq!(skipped, 0, "an added field does not make a line a different version");
         assert_eq!(new[0].agent_id.as_deref(), Some("ac76b5442617a9edf"));
         assert_eq!(new[0].agent_type.as_deref(), Some("Explore"));
+
+        let launch = LINE.replace(
+            r#""tool_use_id":"toolu_A""#,
+            r#""tool_use_id":"toolu_A","agent_launchers":["spark"]"#,
+        );
+        let (new, skipped) = parse(&launch);
+        assert_eq!(skipped, 0);
+        assert_eq!(new[0].agent_launchers, vec!["spark"]);
     }
 
     #[test]
@@ -481,12 +497,12 @@ mod tests {
             std::fs::write(dir.join(format!("claude-{stamp}.jsonl")), format!("{LINE}\n")).unwrap();
         }
         let cache = SpoolCache::default();
-        let read = read_window(&dir, 2, &cache);
+        let read = read_window_at(&dir, 2, &cache, now);
         // Only the file whose NAME is in the window; the January one is skipped
         // without being opened, which is the point.
         assert_eq!(read.files, Some(1));
         assert_eq!(read.calls.len(), 1);
-        let again = read_window(&dir, 2, &cache);
+        let again = read_window_at(&dir, 2, &cache, now);
         assert_eq!(again.calls.len(), 1);
         assert_eq!(cache.stats().0, 1, "an unchanged file is served from the cache");
         let _ = std::fs::remove_dir_all(&dir);
