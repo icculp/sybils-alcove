@@ -86,7 +86,7 @@ pub struct Session {
     pub path: PathBuf,
 }
 
-#[derive(Debug, Default, PartialEq)]
+#[derive(Clone, Debug, Default, PartialEq)]
 struct ParentLink {
     parent: String,
     role: String,
@@ -113,15 +113,11 @@ fn parse_parent_link(raw: &str, child_id: &str) -> Option<ParentLink> {
     (!link.parent.is_empty()).then_some(link)
 }
 
-fn apply_parent_link(info: &mut Scan) {
+fn read_parent_link(info: &Scan) -> Option<ParentLink> {
     let path = info.path.with_extension("alcove-parent.json");
-    let Some(link) = std::fs::read_to_string(path)
+    std::fs::read_to_string(path)
         .ok()
         .and_then(|raw| parse_parent_link(&raw, &info.session_id))
-    else {
-        return;
-    };
-    apply_link_fields(info, link);
 }
 
 fn apply_link_fields(info: &mut Scan, link: ParentLink) {
@@ -137,6 +133,26 @@ fn apply_link_fields(info: &mut Scan, link: ParentLink) {
     if info.spawn_status.is_empty() {
         info.spawn_status = link.status;
     }
+}
+
+fn remember_parent_link(
+    links: &mut HashMap<String, ParentLink>,
+    session_id: &str,
+    link: Option<ParentLink>,
+) {
+    if let Some(link) = link {
+        links.insert(session_id.to_string(), link);
+    }
+}
+
+fn merge_turn_rows(prior: &mut Scan, current: &Scan) {
+    let mut seen: HashSet<String> = prior.turn_rows.iter().map(|row| row.id.clone()).collect();
+    for row in &current.turn_rows {
+        if seen.insert(row.id.clone()) {
+            prior.turn_rows.push(row.clone());
+        }
+    }
+    prior.turns = prior.turn_rows.len() as i64;
 }
 
 fn adopt_current_file(prior: &mut Scan, current: &Scan) {
@@ -443,6 +459,18 @@ pub fn collect(root: &Path, cache: &ScanCache<Scan>) -> Vec<Session> {
         info.live = info.age_s.map(|a| a < live_window).unwrap_or(false);
     }
 
+    // A resumed thread may have a sidecar beside any one of its rollouts. Keep
+    // the newest sidecar actually present; a newer rollout without one must not
+    // erase an older valid parent edge.
+    let mut parent_links: HashMap<String, ParentLink> = HashMap::new();
+    for info in &scans {
+        remember_parent_link(
+            &mut parent_links,
+            &info.session_id,
+            read_parent_link(info),
+        );
+    }
+
     let mut merged: Vec<Scan> = Vec::new();
     let mut index: HashMap<String, usize> = HashMap::new();
     for info in scans {
@@ -460,8 +488,7 @@ pub fn collect(root: &Path, cache: &ScanCache<Scan>) -> Vec<Session> {
                 // effectively untested — in Python too.
                 let prior = &mut merged[at];
                 prior.size += info.size;
-                prior.turns += info.turns;
-                prior.turn_rows.extend(info.turn_rows.clone());
+                merge_turn_rows(prior, &info);
                 for m in &info.timeline {
                     if prior.timeline.last().map(|t| &t.model) != Some(&m.model) {
                         prior.timeline.push(m.clone());
@@ -539,9 +566,11 @@ pub fn collect(root: &Path, cache: &ScanCache<Scan>) -> Vec<Session> {
         info.spawn_status = edge.map(|e| e.status.clone()).unwrap_or_default();
         info.branch = meta.map(|m| m.branch.clone()).unwrap_or_default();
         // The standalone Spark fallback has no native spawn edge. Its wrapper
-        // writes this adjacent sidecar after Codex closes the rollout. Native
+        // writes an adjacent sidecar after Codex closes the rollout. Native
         // transcript and sqlite facts above remain authoritative.
-        apply_parent_link(info);
+        if let Some(link) = parent_links.get(&info.session_id).cloned() {
+            apply_link_fields(info, link);
+        }
     }
 
     let session_ids: HashSet<String> =
@@ -628,9 +657,10 @@ mod tests {
     use std::path::PathBuf;
 
     use super::{
-        adopt_current_file, apply_link_fields, has_local_parent, parse_parent_link, ParentLink,
-        Scan,
+        adopt_current_file, apply_link_fields, has_local_parent, merge_turn_rows,
+        parse_parent_link, remember_parent_link, ParentLink, Scan,
     };
+    use crate::model::TurnRow;
 
     #[test]
     fn parses_matching_fallback_parent_link() {
@@ -694,6 +724,51 @@ mod tests {
         assert_eq!(prior.path, PathBuf::from("new.jsonl"));
         assert_eq!(prior.age_s, Some(1.0));
         assert!(prior.live);
+    }
+
+    #[test]
+    fn newer_rollout_without_sidecar_keeps_older_parent_link() {
+        let older = ParentLink {
+            parent: "parent".into(),
+            ..ParentLink::default()
+        };
+        let mut links = std::collections::HashMap::new();
+        remember_parent_link(&mut links, "child", Some(older.clone()));
+        remember_parent_link(&mut links, "child", None);
+        assert_eq!(links.get("child"), Some(&older));
+    }
+
+    #[test]
+    fn resumed_thread_deduplicates_replayed_assistant_rows() {
+        let row = |id: &str| TurnRow {
+            id: id.into(),
+            ts: String::new(),
+            model: String::new(),
+            input: None,
+            output: None,
+            cache_read: None,
+            cache_write: None,
+            effort: String::new(),
+            thinking_blocks: None,
+            reasoning_tokens: None,
+            version: String::new(),
+        };
+        let mut prior = Scan {
+            turns: 1,
+            turn_rows: vec![row("replayed")],
+            ..Scan::default()
+        };
+        let current = Scan {
+            turns: 2,
+            turn_rows: vec![row("replayed"), row("new")],
+            ..Scan::default()
+        };
+        merge_turn_rows(&mut prior, &current);
+        assert_eq!(prior.turns, 2);
+        assert_eq!(
+            prior.turn_rows.iter().map(|row| row.id.as_str()).collect::<Vec<_>>(),
+            vec!["replayed", "new"]
+        );
     }
 
     #[test]
