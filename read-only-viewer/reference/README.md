@@ -73,5 +73,11 @@ purpose are listed here, so a reader is never misled about which is correct:
   turn they governed instead; the divergence between the two reaches 37.8 s on a
   live turn in that same file.
 
+- **Spark fallback parent sidecars (Rust only).** The command fallback writes an
+  adjacent `*.alcove-parent.json` because standalone `codex exec` has no native
+  spawn edge. Rust consumes that edge after transcript and sqlite enrichment;
+  this frozen reference does not. The equivalence fixture therefore excludes
+  these sidecars.
+
 The browser UI in `../static/` is **shared**, not part of this reference — both
 implementations serve the same files.

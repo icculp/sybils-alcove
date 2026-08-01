@@ -5,7 +5,7 @@
 //! A Codex subagent writes a full sibling transcript with its own thread id; the
 //! link back is `parent_thread_id` in its `session_meta`.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
 use serde_json::Value;
@@ -16,7 +16,7 @@ use crate::model::{
 use crate::cache::ScanCache;
 use crate::transcripts::{chronological, file_size, head_events, tail_events};
 
-#[derive(Clone)]
+#[derive(Clone, Default)]
 pub struct Scan {
     pub turn_rows: Vec<TurnRow>,
     pub session_id: String,
@@ -84,6 +84,85 @@ pub struct Session {
     pub compactions: Vec<Compaction>,
     pub subagents: Vec<SubAgent>,
     pub path: PathBuf,
+}
+
+#[derive(Clone, Debug, Default, PartialEq)]
+struct ParentLink {
+    parent: String,
+    role: String,
+    nickname: String,
+    status: String,
+}
+
+fn parse_parent_link(raw: &str, child_id: &str) -> Option<ParentLink> {
+    let value: Value = serde_json::from_str(raw).ok()?;
+    if value.get("v").and_then(Value::as_i64) != Some(1)
+        || value.get("child_thread_id").and_then(Value::as_str) != Some(child_id)
+    {
+        return None;
+    }
+    let get = |key: &str| {
+        value.get(key).and_then(Value::as_str).unwrap_or("").to_string()
+    };
+    let link = ParentLink {
+        parent: get("parent_thread_id"),
+        role: get("agent_role"),
+        nickname: get("agent_nickname"),
+        status: get("status"),
+    };
+    (!link.parent.is_empty()).then_some(link)
+}
+
+fn read_parent_link(info: &Scan) -> Option<ParentLink> {
+    let path = info.path.with_extension("alcove-parent.json");
+    std::fs::read_to_string(path)
+        .ok()
+        .and_then(|raw| parse_parent_link(&raw, &info.session_id))
+}
+
+fn apply_link_fields(info: &mut Scan, link: ParentLink) {
+    if info.parent.is_empty() {
+        info.parent = link.parent;
+    }
+    if info.role.is_empty() {
+        info.role = link.role;
+    }
+    if info.nickname.is_empty() {
+        info.nickname = link.nickname;
+    }
+    if info.spawn_status.is_empty() {
+        info.spawn_status = link.status;
+    }
+}
+
+fn remember_parent_link(
+    links: &mut HashMap<String, ParentLink>,
+    session_id: &str,
+    link: Option<ParentLink>,
+) {
+    if let Some(link) = link {
+        links.insert(session_id.to_string(), link);
+    }
+}
+
+fn merge_turn_rows(prior: &mut Scan, current: &Scan) {
+    let mut seen: HashSet<String> = prior.turn_rows.iter().map(|row| row.id.clone()).collect();
+    for row in &current.turn_rows {
+        if seen.insert(row.id.clone()) {
+            prior.turn_rows.push(row.clone());
+        }
+    }
+    prior.turns = prior.turn_rows.len() as i64;
+}
+
+fn adopt_current_file(prior: &mut Scan, current: &Scan) {
+    prior.path = current.path.clone();
+    prior.age_s = current.age_s;
+    prior.live = current.live;
+}
+
+fn has_local_parent(info: &Scan, session_ids: &HashSet<String>) -> bool {
+    !info.parent.is_empty() && session_ids.contains(&info.parent)
 }
 
 pub fn scan(path: &Path) -> Scan {
@@ -380,6 +459,18 @@ pub fn collect(root: &Path, cache: &ScanCache<Scan>) -> Vec<Session> {
         info.live = info.age_s.map(|a| a < live_window).unwrap_or(false);
     }
 
+    // A resumed thread may have a sidecar beside any one of its rollouts. Keep
+    // the newest sidecar actually present; a newer rollout without one must not
+    // erase an older valid parent edge.
+    let mut parent_links: HashMap<String, ParentLink> = HashMap::new();
+    for info in &scans {
+        remember_parent_link(
+            &mut parent_links,
+            &info.session_id,
+            read_parent_link(info),
+        );
+    }
+
     let mut merged: Vec<Scan> = Vec::new();
     let mut index: HashMap<String, usize> = HashMap::new();
     for info in scans {
@@ -397,8 +488,7 @@ pub fn collect(root: &Path, cache: &ScanCache<Scan>) -> Vec<Session> {
                 // effectively untested — in Python too.
                 let prior = &mut merged[at];
                 prior.size += info.size;
-                prior.turns += info.turns;
-                prior.turn_rows.extend(info.turn_rows.clone());
+                merge_turn_rows(prior, &info);
                 for m in &info.timeline {
                     if prior.timeline.last().map(|t| &t.model) != Some(&m.model) {
                         prior.timeline.push(m.clone());
@@ -445,6 +535,7 @@ pub fn collect(root: &Path, cache: &ScanCache<Scan>) -> Vec<Session> {
                 if !info.last_ts.is_empty() {
                     prior.last_ts = info.last_ts.clone();
                 }
+                adopt_current_file(prior, &info);
             }
         }
     }
@@ -474,17 +565,25 @@ pub fn collect(root: &Path, cache: &ScanCache<Scan>) -> Vec<Session> {
         }
         info.spawn_status = edge.map(|e| e.status.clone()).unwrap_or_default();
         info.branch = meta.map(|m| m.branch.clone()).unwrap_or_default();
+        // The standalone Spark fallback has no native spawn edge. Its wrapper
+        // writes an adjacent sidecar after Codex closes the rollout. Native
+        // transcript and sqlite facts above remain authoritative.
+        if let Some(link) = parent_links.get(&info.session_id).cloned() {
+            apply_link_fields(info, link);
+        }
     }
 
+    let session_ids: HashSet<String> =
+        merged.iter().map(|info| info.session_id.clone()).collect();
     let mut children: HashMap<String, Vec<usize>> = HashMap::new();
     for (i, info) in merged.iter().enumerate() {
-        if !info.parent.is_empty() {
+        if has_local_parent(info, &session_ids) {
             children.entry(info.parent.clone()).or_default().push(i);
         }
     }
 
     for (i, info) in merged.iter().enumerate() {
-        if !info.parent.is_empty() {
+        if has_local_parent(info, &session_ids) {
             continue; // rendered under its parent
         }
         let mut subs: Vec<SubAgent> = Vec::new();
@@ -550,4 +649,134 @@ pub fn collect(root: &Path, cache: &ScanCache<Scan>) -> Vec<Session> {
         });
     }
     sessions
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::HashSet;
+    use std::path::PathBuf;
+
+    use super::{
+        adopt_current_file, apply_link_fields, has_local_parent, merge_turn_rows,
+        parse_parent_link, remember_parent_link, ParentLink, Scan,
+    };
+    use crate::model::TurnRow;
+
+    #[test]
+    fn parses_matching_fallback_parent_link() {
+        let raw = r#"{"v":1,"child_thread_id":"child","parent_thread_id":"parent","agent_role":"spark-triage","agent_nickname":"Spark","status":"closed"}"#;
+        assert_eq!(
+            parse_parent_link(raw, "child"),
+            Some(ParentLink {
+                parent: "parent".into(),
+                role: "spark-triage".into(),
+                nickname: "Spark".into(),
+                status: "closed".into(),
+            })
+        );
+    }
+
+    #[test]
+    fn rejects_link_for_another_rollout() {
+        let raw = r#"{"v":1,"child_thread_id":"other","parent_thread_id":"parent"}"#;
+        assert_eq!(parse_parent_link(raw, "child"), None);
+    }
+
+    #[test]
+    fn transcript_and_state_fields_outrank_sidecar_fields() {
+        let mut scan = Scan {
+            parent: "native-parent".into(),
+            role: "worker".into(),
+            nickname: "Native".into(),
+            spawn_status: "open".into(),
+            ..Scan::default()
+        };
+        apply_link_fields(
+            &mut scan,
+            ParentLink {
+                parent: "sidecar-parent".into(),
+                role: "spark-triage".into(),
+                nickname: "Spark".into(),
+                status: "closed".into(),
+            },
+        );
+        assert_eq!(scan.parent, "native-parent");
+        assert_eq!(scan.role, "worker");
+        assert_eq!(scan.nickname, "Native");
+        assert_eq!(scan.spawn_status, "open");
+    }
+
+    #[test]
+    fn resumed_thread_uses_newest_rollout_for_its_sidecar() {
+        let mut prior = Scan {
+            path: PathBuf::from("old.jsonl"),
+            age_s: Some(10.0),
+            live: false,
+            ..Scan::default()
+        };
+        let current = Scan {
+            path: PathBuf::from("new.jsonl"),
+            age_s: Some(1.0),
+            live: true,
+            ..Scan::default()
+        };
+        adopt_current_file(&mut prior, &current);
+        assert_eq!(prior.path, PathBuf::from("new.jsonl"));
+        assert_eq!(prior.age_s, Some(1.0));
+        assert!(prior.live);
+    }
+
+    #[test]
+    fn newer_rollout_without_sidecar_keeps_older_parent_link() {
+        let older = ParentLink {
+            parent: "parent".into(),
+            ..ParentLink::default()
+        };
+        let mut links = std::collections::HashMap::new();
+        remember_parent_link(&mut links, "child", Some(older.clone()));
+        remember_parent_link(&mut links, "child", None);
+        assert_eq!(links.get("child"), Some(&older));
+    }
+
+    #[test]
+    fn resumed_thread_deduplicates_replayed_assistant_rows() {
+        let row = |id: &str| TurnRow {
+            id: id.into(),
+            ts: String::new(),
+            model: String::new(),
+            input: None,
+            output: None,
+            cache_read: None,
+            cache_write: None,
+            effort: String::new(),
+            thinking_blocks: None,
+            reasoning_tokens: None,
+            version: String::new(),
+        };
+        let mut prior = Scan {
+            turns: 1,
+            turn_rows: vec![row("replayed")],
+            ..Scan::default()
+        };
+        let current = Scan {
+            turns: 2,
+            turn_rows: vec![row("replayed"), row("new")],
+            ..Scan::default()
+        };
+        merge_turn_rows(&mut prior, &current);
+        assert_eq!(prior.turns, 2);
+        assert_eq!(
+            prior.turn_rows.iter().map(|row| row.id.as_str()).collect::<Vec<_>>(),
+            vec!["replayed", "new"]
+        );
+    }
+
+    #[test]
+    fn orphan_parent_link_remains_top_level() {
+        let scan = Scan {
+            parent: "missing".into(),
+            ..Scan::default()
+        };
+        assert!(!has_local_parent(&scan, &HashSet::new()));
+    }
 }

@@ -134,6 +134,7 @@ Claude Code
 
 Codex
   ~/.codex/sessions/<Y>/<M>/<D>/rollout-<ts>-<id>.jsonl    one per session;
+  ~/.codex/sessions/<Y>/<M>/<D>/*.alcove-parent.json       fallback parent edge;
       spawned agents are sibling files linked by parent_thread_id
 ```
 
