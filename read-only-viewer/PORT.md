@@ -159,6 +159,28 @@ an existing store means rebuilding the table and re-ingesting — data traded fo
 correctness, so it is an operator decision, not something a connect path should
 do on its own.
 
+## `tool_call.params` is Rust-only, and is never backfilled
+
+The hook spools a spawn's whitelisted parameters — `model` above all — as a
+`params` object (see `hooks/README.md`), and `tool_call` grows a `params TEXT NOT
+NULL DEFAULT ''` column to hold the compact JSON. The frozen reference has no
+spool ingest of its own to teach, so this is Rust-only by the same rule as
+`turn.effort`.
+
+Third instance of the guarded-migration pattern above: `table_info(tool_call)`,
+`ALTER TABLE … ADD COLUMN` when absent, one line printed, idempotent. Without it
+every tool-call ingest against an older store fails outright — losing not the
+parameters but *every* tool call in the transaction.
+
+**A migrated store does not gain parameters for spawns it already ingested**, and
+that is not a gap to close later: those rows came from spool lines that never
+carried `params`, and re-reading a spool file is a no-op by construction. Only
+spawns spooled after the hook learned to send it are filled. Verified on a
+legacy-shaped copy — column added, one migration line, 252 existing rows keep
+`''`, a second run silent and `tool_call_new=0`. Backfilling would mean inventing
+the model a past spawn ran, which is the class of guess this repo exists to
+refuse.
+
 ## Deliberate divergence: `turn.effort` and `turn.version` are Rust-only
 
 The Rust scanners trace two per-turn facts the reference never learned, and the

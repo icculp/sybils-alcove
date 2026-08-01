@@ -92,6 +92,17 @@ CREATE TABLE IF NOT EXISTS subagent (
 -- `tool_use_id` stays its own column even though it is inside `id`. It is the
 -- only thing that pairs a `pre` with its `post`, and a later view wants that
 -- pairing to be a join rather than string surgery on the key.
+--
+-- `params` holds a spawn's whitelisted parameters as compact JSON, `''` when the
+-- call was not a spawn or named none. One JSON column rather than a column per
+-- parameter: the two harnesses spell them differently (`subagent_type` vs
+-- `agent_type`) and a third will again, so exploding them would make every
+-- harness release a schema migration.
+--
+-- Comments live ABOVE this statement, never between its columns: SQLite's
+-- ALTER TABLE DROP COLUMN rewrites the stored schema text and chokes on a
+-- comment inside the column list ("incomplete input"), which would leave an
+-- operator unable to undo a column by hand.
 CREATE TABLE IF NOT EXISTS tool_call (
   id          TEXT PRIMARY KEY,
   harness     TEXT NOT NULL,
@@ -103,7 +114,8 @@ CREATE TABLE IF NOT EXISTS tool_call (
   target      TEXT,
   arg         TEXT,
   ok          INTEGER,
-  tool_use_id TEXT
+  tool_use_id TEXT,
+  params      TEXT NOT NULL DEFAULT ''
 );
 CREATE INDEX IF NOT EXISTS tool_call_session_ts ON tool_call(session_id, ts);
 CREATE INDEX IF NOT EXISTS tool_call_ts         ON tool_call(ts);
@@ -195,6 +207,7 @@ pub fn connect(write: bool) -> Result<Connection, Unavailable> {
         conn.execute_batch(SCHEMA).map_err(|e| Unavailable(e.to_string()))?;
         migrate_turn_thread_id(&conn)?;
         migrate_turn_facts(&conn)?;
+        migrate_tool_call_params(&conn)?;
         return Ok(conn);
     }
     if !target.exists() {
@@ -224,16 +237,22 @@ pub fn connect(write: bool) -> Result<Connection, Unavailable> {
 /// keep. Recovering them means rebuilding the table and re-ingesting, which
 /// trades data for correctness and is an operator decision — see
 /// `read-only-viewer/PORT.md`. Ingest working again is the point here.
-fn turn_columns(conn: &Connection) -> Result<Vec<String>, Unavailable> {
+fn table_columns(conn: &Connection, table: &str) -> Result<Vec<String>, Unavailable> {
+    // `table` is a literal from this file, never user input; PRAGMA does not
+    // take a bound parameter for its argument.
     let mut stmt = conn
-        .prepare("PRAGMA table_info(turn)")
-        .map_err(|e| Unavailable(format!("turn table_info: {e}")))?;
+        .prepare(&format!("PRAGMA table_info({table})"))
+        .map_err(|e| Unavailable(format!("{table} table_info: {e}")))?;
     let cols = stmt
         .query_map([], |r| r.get::<_, String>(1))
-        .map_err(|e| Unavailable(format!("turn table_info: {e}")))?
+        .map_err(|e| Unavailable(format!("{table} table_info: {e}")))?
         .collect::<Result<Vec<String>, _>>()
-        .map_err(|e| Unavailable(format!("turn table_info: {e}")))?;
+        .map_err(|e| Unavailable(format!("{table} table_info: {e}")))?;
     Ok(cols)
+}
+
+fn turn_columns(conn: &Connection) -> Result<Vec<String>, Unavailable> {
+    table_columns(conn, "turn")
 }
 
 fn migrate_turn_thread_id(conn: &Connection) -> Result<(), Unavailable> {
@@ -284,6 +303,38 @@ fn migrate_turn_facts(conn: &Connection) -> Result<(), Unavailable> {
         "store: migrated `turn` — added {}. Rows written before this keep '' \
          (not recorded), which is what they are.",
         added.join(" and ")
+    );
+    Ok(())
+}
+
+/// Add `tool_call.params` to a store created before the column existed.
+///
+/// Third instance of the same guarded shape, and for the same reason the other
+/// two exist: `CREATE TABLE IF NOT EXISTS` cannot reshape a table that is
+/// already there, so without this every tool-call ingest against an older store
+/// fails outright with "table tool_call has no column named params" — losing
+/// not just the spawn parameters but every tool call in the same transaction.
+///
+/// Idempotent: a second connect sees the column and returns without touching
+/// anything. Lossless: rows written before the column existed keep `''`, which
+/// is exactly what the hook writes for a call that named no parameters, and
+/// what such a row is — no spawn parameters were observed.
+///
+/// It does NOT backfill, and cannot: the spool lines those rows came from never
+/// carried `params` either, and `INSERT OR IGNORE` keeps the row already there
+/// when the same line is re-read. So a migrated store fills `params` only for
+/// spawns spooled after the hook learned to send it — measured on a legacy-shaped
+/// copy: the column appears, 252 rows keep `''`, and re-ingesting the same spool
+/// adds nothing. Anything else would mean inventing the model a past spawn used.
+fn migrate_tool_call_params(conn: &Connection) -> Result<(), Unavailable> {
+    if table_columns(conn, "tool_call")?.iter().any(|c| c == "params") {
+        return Ok(());
+    }
+    conn.execute_batch(r"ALTER TABLE tool_call ADD COLUMN params TEXT NOT NULL DEFAULT ''")
+        .map_err(|e| Unavailable(format!("tool_call params migration: {e}")))?;
+    eprintln!(
+        "store: migrated `tool_call` — added params. Rows written before this keep '' \
+         (no spawn parameters observed), which is what they are."
     );
     Ok(())
 }
@@ -508,8 +559,8 @@ pub fn ingest_tool_calls(
             .prepare(
                 r#"INSERT OR IGNORE INTO tool_call
                      (id, harness, session_id, ts, event, tool, cwd, target, arg,
-                      ok, tool_use_id)
-                   VALUES (?,?,?,?,?,?,?,?,?,?,?)"#,
+                      ok, tool_use_id, params)
+                   VALUES (?,?,?,?,?,?,?,?,?,?,?,?)"#,
             )
             .map_err(|e| Unavailable(e.to_string()))?;
         for call in calls {
@@ -525,6 +576,9 @@ pub fn ingest_tool_calls(
                 call.arg,
                 call.ok,
                 call.tool_use_id,
+                // '' rather than NULL: the column is NOT NULL so a migrated
+                // store and a fresh one spell "nothing observed" the same way.
+                call.params_json(),
             ])
             .map_err(|e| Unavailable(format!("tool_call insert: {e}")))?;
         }

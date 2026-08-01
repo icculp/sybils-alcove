@@ -64,6 +64,37 @@ TARGET_KEYS = (
     "url",
 )
 
+# Tools that START A NEW AGENT. Claude names it `Agent` (aliased `Task`); Codex
+# names it `spawn_agent`, sometimes prefixed by the tool namespace
+# (`multi_agent_v1spawn_agent`), which is why this is a substring test there.
+# The other `multi_agent_v1*` tools -- wait/close/send_input/resume -- act on an
+# agent that already exists and carry no spawn parameters.
+SPAWN_TOOLS = ("Agent", "Task", "spawn_agent")
+
+# tool_input keys spooled into `params` on a spawn. WHICH MODEL A SUBAGENT RAN
+# is the single most governance-relevant thing about a spawn, and it was the one
+# parameter nothing recorded: `arg` carries only the description.
+#
+# A whitelist, in this order, and deliberately short. `prompt` / `message` are
+# the task body -- bulky, already in the transcript, and never spooled.
+# Priority order is also the order params are DROPPED in when the 300-char cap
+# bites, so the most load-bearing keys come first.
+PARAM_KEYS = (
+    "model",  # both harnesses; absent when the caller did not choose one
+    "subagent_type",  # claude Agent/Task
+    "agent_type",  # codex spawn_agent
+    "effort",
+    "reasoning_effort",  # codex spawn_agent's spelling of effort
+    "run_in_background",  # claude; a bg child outlives its parent's turn
+    "isolation",  # claude; "worktree" / "remote"
+    "fork_context",  # codex; whether the child inherited the parent's history
+)
+
+# Serialized `params` cap. Every value here is an enum, a bool or a model name,
+# so 300 chars is generous -- it exists so a harness that one day passes a long
+# free-form value cannot push the line toward the 2048-byte cap.
+MAX_PARAMS = 300
+
 
 def _redact(text):
     """Blunt credential scrub. Over-redaction is safe; under-redaction is not."""
@@ -253,12 +284,64 @@ def _command_launchers(command, depth=0):
     return out
 
 
+def _is_spawn(tool):
+    """Does this tool START AN AGENT? See SPAWN_TOOLS for why Codex is a
+    substring test and Claude is not."""
+    if not isinstance(tool, str) or not tool:
+        return False
+    return tool in ("Agent", "Task") or "spawn_agent" in tool.lower()
+
+
+def _spawn_params(tool, tool_input):
+    """-> dict | None. The whitelisted spawn parameters of an agent launch.
+
+    `None` -- the key is then omitted entirely -- for every tool that does not
+    start an agent, and for a spawn whose payload named none of them. Absent and
+    empty are the same answer here, and neither is "the default was used": the
+    hook reports what the caller passed, and a harness that fills a default in
+    later does not show up in the payload at all.
+
+    Never returns a prompt. The keys are a whitelist, not "everything but
+    `prompt`", so a parameter added by a future harness release cannot leak a
+    body into the spool by being unrecognised.
+    """
+    import json
+
+    if not _is_spawn(tool) or not isinstance(tool_input, dict):
+        return None
+    params = {}
+    for key in PARAM_KEYS:
+        value = tool_input.get(key)
+        # bool first: isinstance(True, int) is true, and `run_in_background`
+        # must stay a JSON bool rather than becoming 1.
+        if isinstance(value, bool) or isinstance(value, (int, float)):
+            pass
+        elif isinstance(value, str):
+            value = _str(value, MAX_FIELD)
+        else:
+            continue  # absent, null, or a shape this will not guess at
+        if value is None:
+            continue
+        # Grow one key at a time and stop at the cap rather than clipping the
+        # serialized object: a truncated JSON string is unparseable, and half a
+        # parameter set is worse than a documented prefix of one.
+        candidate = dict(params, **{key: value})
+        if len(json.dumps(candidate, ensure_ascii=True, separators=(",", ":"))) > MAX_PARAMS:
+            break
+        params = candidate
+    # No credential scrub: every value is a harness enum, a bool or a model
+    # name, never user prose -- and the scrub would eat any of them that
+    # happened to contain "session" or "key". Same reasoning as the stop-family
+    # ids below.
+    return params or None
+
+
 def _agent_launchers(tool, tool_input):
     """Return launcher names without retaining a command body or agent prompt."""
     import json
     import re
 
-    if tool in ("Agent", "Task") or "spawn_agent" in tool.lower():
+    if _is_spawn(tool):
         if isinstance(tool_input, dict):
             role = tool_input.get("subagent_type") or tool_input.get("agent_type")
             if isinstance(role, str) and role.strip():
@@ -446,6 +529,14 @@ def main():
         # command and prompt remain subject to the stricter arg whitelist above.
         "agent_launchers": _agent_launchers(tool, payload.get("tool_input")),
     }
+
+    # The spawn's own parameters -- above all WHICH MODEL the child got, which
+    # nothing else on this line records. Added only when there is something to
+    # say, so a non-spawn line is byte-identical to what it was before this
+    # existed, and an old line means exactly what an absent key means.
+    params = _spawn_params(tool, payload.get("tool_input"))
+    if params:
+        record["params"] = params
 
     def encode(rec):
         return json.dumps(rec, ensure_ascii=True, separators=(",", ":")).encode() + b"\n"

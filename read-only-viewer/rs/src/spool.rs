@@ -40,6 +40,7 @@
 use std::path::{Path, PathBuf};
 
 use serde::Deserialize;
+use serde_json::Value;
 
 /// The producer caps `arg` here. A longer one is CLIPPED rather than rejected:
 /// an over-long argument is a producer bug, and dropping the record would lose
@@ -94,6 +95,21 @@ pub struct ToolCall {
     /// prompt that named them. Additive: old lines parse as an empty list.
     #[serde(default)]
     pub agent_launchers: Vec<String>,
+    /// The whitelisted parameters of an agent SPAWN — `model` above all, which
+    /// is the most governance-relevant thing about a launch and the one thing
+    /// no other field on this line carries. Present only on a spawn that named
+    /// at least one of them; `None` on every other line and on every line
+    /// written before the hook learned to send it.
+    ///
+    /// Held as an untyped `Value` on purpose. The two harnesses spell these
+    /// differently (`subagent_type` vs `agent_type`, `effort` vs
+    /// `reasoning_effort`) and a third will spell them differently again; the
+    /// hook's whitelist decides what may appear, and a key this build has never
+    /// heard of must reach the store rather than fail the line. A typed struct
+    /// would have to be edited in lockstep with the hook to avoid dropping the
+    /// very parameter that was just added.
+    #[serde(default)]
+    pub params: Option<serde_json::Value>,
 }
 
 /// FNV-1a, 128-bit. Hand-rolled rather than pulling in a hash crate, and NOT
@@ -124,6 +140,20 @@ impl ToolCall {
             if arg.chars().count() > MAX_ARG {
                 self.arg = Some(arg.chars().take(MAX_ARG).collect());
             }
+        }
+    }
+
+    /// `params` as the compact JSON string the store holds, `""` when the line
+    /// carried none.
+    ///
+    /// `""` and `"{}"` would both render as "no parameters" but only one of them
+    /// is what an absent field means, so an empty object collapses to `""` here
+    /// and the store has a single spelling of "this spawn named nothing".
+    pub fn params_json(&self) -> String {
+        match &self.params {
+            Some(Value::Object(map)) if map.is_empty() => String::new(),
+            Some(value) if !value.is_null() => serde_json::to_string(value).unwrap_or_default(),
+            _ => String::new(),
         }
     }
 
@@ -482,6 +512,61 @@ mod tests {
         let (new, skipped) = parse(&launch);
         assert_eq!(skipped, 0);
         assert_eq!(new[0].agent_launchers, vec!["spark"]);
+    }
+
+    /// Verbatim from the live spool, produced by replaying a captured
+    /// PreToolUse payload through the hook. `model` is present here because the
+    /// caller named one; a spawn that does not name a model carries no `model`
+    /// key at all, which the second case below is.
+    const SPAWN_LINE: &str = r#"{"v":1,"ts":"2026-08-01T06:13:54.426Z","harness":"claude","event":"pre","session_id":"0e24efd7-13c4-4591-8307-ef1ee734c2a8","tool":"Agent","cwd":"/root/proj/sybils-alcove","target":null,"arg":"List files in hooks/ directory","ok":null,"tool_use_id":"toolu_01Lv1dhUnsi19njv2QXmKxwK","agent_id":null,"agent_type":null,"agent_launchers":["Explore"],"params":{"model":"haiku","subagent_type":"Explore","run_in_background":false}}"#;
+
+    #[test]
+    fn spawn_params_parse_and_absence_is_not_an_error() {
+        // Three generations of line, all valid at v1: with params, a spawn
+        // without them, and a pre-params line that never had the field.
+        let no_model = SPAWN_LINE
+            .replace(r#""model":"haiku","#, "")
+            .replace(r#""arg":"List files in hooks/ directory""#, r#""arg":"other""#);
+        let (calls, skipped) = parse(&format!("{SPAWN_LINE}\n{no_model}\n{LINE}\n"));
+        assert_eq!(skipped, 0, "an added field does not make a line a different version");
+        assert_eq!(calls.len(), 3);
+
+        let params = calls[0].params.as_ref().expect("a spawn line carries params");
+        assert_eq!(params["model"], "haiku");
+        assert_eq!(params["subagent_type"], "Explore");
+        assert_eq!(params["run_in_background"], false);
+        assert_eq!(
+            calls[0].params_json(),
+            r#"{"model":"haiku","run_in_background":false,"subagent_type":"Explore"}"#
+        );
+
+        assert!(
+            calls[1].params.as_ref().unwrap().get("model").is_none(),
+            "no model key means the caller did not choose one — never a default"
+        );
+        assert!(calls[2].params.is_none(), "an old line means absent, and absent is not empty");
+        assert_eq!(calls[2].params_json(), "");
+    }
+
+    #[test]
+    fn an_unknown_param_key_does_not_fail_the_line() {
+        // A harness release that adds a spawn parameter must not cost this build
+        // the whole observation — including the `model` sitting next to it.
+        let future = SPAWN_LINE.replace(r#""params":{"#, r#""params":{"quantum_budget":7,"#);
+        let (calls, skipped) = parse(&future);
+        assert_eq!(skipped, 0);
+        assert_eq!(calls[0].params.as_ref().unwrap()["quantum_budget"], 7);
+        assert_eq!(calls[0].params.as_ref().unwrap()["model"], "haiku");
+    }
+
+    #[test]
+    fn an_empty_param_object_stores_as_absent() {
+        let empty = SPAWN_LINE.replace(
+            r#"{"model":"haiku","subagent_type":"Explore","run_in_background":false}"#,
+            "{}",
+        );
+        let (calls, _) = parse(&empty);
+        assert_eq!(calls[0].params_json(), "", "'{{}}' and absent must not be two spellings");
     }
 
     #[test]
