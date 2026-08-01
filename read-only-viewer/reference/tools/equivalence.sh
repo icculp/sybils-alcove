@@ -19,6 +19,9 @@ if [ "${1:-}" = "--freeze" ]; then
   rm -rf "$out"; mkdir -p "$out"
   cp -a "${ALCOVE_CLAUDE_ROOT:-$HOME/.claude/projects}" "$out/claude"
   cp -a "${ALCOVE_CODEX_ROOT:-$HOME/.codex/sessions}" "$out/codex"
+  # Parent-link sidecars are a documented Rust-only feature; the Python
+  # reference is frozen. Keep this gate scoped to the shared transcript parser.
+  find "$out/codex" -name '*.alcove-parent.json' -delete
   # Codex's own sqlite is enrichment for BOTH implementations now, so it has to
   # be frozen too — reading the live one would let Codex change it mid-gate.
   mkdir -p "$out/codex-home"

@@ -62,6 +62,17 @@ fn sub_state(
     }
 }
 
+fn codex_sub_state(
+    status: &str,
+    verdict: Option<liveness::Verdict>,
+    fresh_transcript: bool,
+) -> (&'static str, Option<String>, bool) {
+    if matches!(status, "closed" | "completed" | "failed") {
+        return ("idle", None, false);
+    }
+    sub_state(verdict, fresh_transcript)
+}
+
 fn age_s(path: &PathBuf) -> Option<f64> {
     let modified = path.metadata().ok()?.modified().ok()?;
     let now = SystemTime::now();
@@ -417,8 +428,11 @@ impl Collector {
                     // age window answers — labelled inferred. It starts telling
                     // the truth the moment someone trusts the hooks in the TUI,
                     // with no code change here.
-                    let (sub_state, stopped_at, inferred) =
-                        sub_state(fold.child(&a.id, None, now, window_ms), a.live);
+                    let (sub_state, stopped_at, inferred) = codex_sub_state(
+                        &a.status,
+                        fold.child(&a.id, None, now, window_ms),
+                        a.live,
+                    );
                     json!({
                         "id": a.id, "label": a.label, "model": a.model,
                         "effort": a.effort, "effort_timeline": a.effort_timeline,
@@ -509,5 +523,21 @@ impl Collector {
             },
             "sessions": out,
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::codex_sub_state;
+
+    #[test]
+    fn terminal_codex_status_outranks_freshness() {
+        assert_eq!(codex_sub_state("closed", None, true), ("idle", None, false));
+        assert_eq!(codex_sub_state("failed", None, true), ("idle", None, false));
+    }
+
+    #[test]
+    fn open_codex_status_still_uses_freshness() {
+        assert_eq!(codex_sub_state("open", None, true), ("running", None, true));
     }
 }

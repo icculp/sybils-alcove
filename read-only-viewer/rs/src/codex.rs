@@ -16,7 +16,7 @@ use crate::model::{
 use crate::cache::ScanCache;
 use crate::transcripts::{chronological, file_size, head_events, tail_events};
 
-#[derive(Clone)]
+#[derive(Clone, Default)]
 pub struct Scan {
     pub turn_rows: Vec<TurnRow>,
     pub session_id: String,
@@ -121,6 +121,10 @@ fn apply_parent_link(info: &mut Scan) {
     else {
         return;
     };
+    apply_link_fields(info, link);
+}
+
+fn apply_link_fields(info: &mut Scan, link: ParentLink) {
     if info.parent.is_empty() {
         info.parent = link.parent;
     }
@@ -133,6 +137,16 @@ fn apply_parent_link(info: &mut Scan) {
     if info.spawn_status.is_empty() {
         info.spawn_status = link.status;
     }
+}
+
+fn adopt_current_file(prior: &mut Scan, current: &Scan) {
+    prior.path = current.path.clone();
+    prior.age_s = current.age_s;
+    prior.live = current.live;
+}
+
+fn has_local_parent(info: &Scan, session_ids: &HashSet<String>) -> bool {
+    !info.parent.is_empty() && session_ids.contains(&info.parent)
 }
 
 pub fn scan(path: &Path) -> Scan {
@@ -494,6 +508,7 @@ pub fn collect(root: &Path, cache: &ScanCache<Scan>) -> Vec<Session> {
                 if !info.last_ts.is_empty() {
                     prior.last_ts = info.last_ts.clone();
                 }
+                adopt_current_file(prior, &info);
             }
         }
     }
@@ -533,13 +548,13 @@ pub fn collect(root: &Path, cache: &ScanCache<Scan>) -> Vec<Session> {
         merged.iter().map(|info| info.session_id.clone()).collect();
     let mut children: HashMap<String, Vec<usize>> = HashMap::new();
     for (i, info) in merged.iter().enumerate() {
-        if !info.parent.is_empty() && session_ids.contains(&info.parent) {
+        if has_local_parent(info, &session_ids) {
             children.entry(info.parent.clone()).or_default().push(i);
         }
     }
 
     for (i, info) in merged.iter().enumerate() {
-        if !info.parent.is_empty() && session_ids.contains(&info.parent) {
+        if has_local_parent(info, &session_ids) {
             continue; // rendered under its parent
         }
         let mut subs: Vec<SubAgent> = Vec::new();
@@ -609,7 +624,13 @@ pub fn collect(root: &Path, cache: &ScanCache<Scan>) -> Vec<Session> {
 
 #[cfg(test)]
 mod tests {
-    use super::{parse_parent_link, ParentLink};
+    use std::collections::HashSet;
+    use std::path::PathBuf;
+
+    use super::{
+        adopt_current_file, apply_link_fields, has_local_parent, parse_parent_link, ParentLink,
+        Scan,
+    };
 
     #[test]
     fn parses_matching_fallback_parent_link() {
@@ -629,5 +650,58 @@ mod tests {
     fn rejects_link_for_another_rollout() {
         let raw = r#"{"v":1,"child_thread_id":"other","parent_thread_id":"parent"}"#;
         assert_eq!(parse_parent_link(raw, "child"), None);
+    }
+
+    #[test]
+    fn transcript_and_state_fields_outrank_sidecar_fields() {
+        let mut scan = Scan {
+            parent: "native-parent".into(),
+            role: "worker".into(),
+            nickname: "Native".into(),
+            spawn_status: "open".into(),
+            ..Scan::default()
+        };
+        apply_link_fields(
+            &mut scan,
+            ParentLink {
+                parent: "sidecar-parent".into(),
+                role: "spark-triage".into(),
+                nickname: "Spark".into(),
+                status: "closed".into(),
+            },
+        );
+        assert_eq!(scan.parent, "native-parent");
+        assert_eq!(scan.role, "worker");
+        assert_eq!(scan.nickname, "Native");
+        assert_eq!(scan.spawn_status, "open");
+    }
+
+    #[test]
+    fn resumed_thread_uses_newest_rollout_for_its_sidecar() {
+        let mut prior = Scan {
+            path: PathBuf::from("old.jsonl"),
+            age_s: Some(10.0),
+            live: false,
+            ..Scan::default()
+        };
+        let current = Scan {
+            path: PathBuf::from("new.jsonl"),
+            age_s: Some(1.0),
+            live: true,
+            ..Scan::default()
+        };
+        adopt_current_file(&mut prior, &current);
+        assert_eq!(prior.path, PathBuf::from("new.jsonl"));
+        assert_eq!(prior.age_s, Some(1.0));
+        assert!(prior.live);
+    }
+
+    #[test]
+    fn orphan_parent_link_remains_top_level() {
+        let scan = Scan {
+            parent: "missing".into(),
+            ..Scan::default()
+        };
+        assert!(!has_local_parent(&scan, &HashSet::new()));
     }
 }
